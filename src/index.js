@@ -22,7 +22,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 //
 // Logging policy: log lifecycle events and errors only. Never log OAuth
 // codes, state values, tokens, or PKCE verifiers.
-// ---------------------------------------------------
+// ---------------------------------------------------------------------------
 
 // ---- Discovery ----
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
@@ -81,7 +81,7 @@ app.get('/authorize', (req, res) => {
   const ourState = rand(16);
   db.prepare(
     'INSERT INTO auth_state (state, client_id, client_redirect_uri, client_state, code_challenge, code_challenge_method, created_at) VALUES (?,?,?,?,?,?,?)'
-  ).run(ourState, client_id, redirect_uri, state || null, code_challenge_method || null, now());
+  ).run(ourState, client_id, redirect_uri, state || null, code_challenge || null, code_challenge_method || null, now());
 
   const u = new URL(`${config.acceloOAuthUrl}/authorize`);
   u.searchParams.set('response_type', 'code');
