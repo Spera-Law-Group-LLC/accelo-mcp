@@ -18,7 +18,7 @@ const rand = (n = 32) => crypto.randomBytes(n).toString('base64url');
 // client (LibreChat), and an OAuth client to Accelo. The MCP client never
 // sees the Accelo token; it gets one of our opaque tokens, which we map to a
 // stored per-user Accelo token. This keeps Accelo's own permission model.
-// ---------------------------------------------------------------------------
+// ---------------------------------------
 
 // ---- Discovery ----
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
@@ -62,8 +62,18 @@ app.post('/register', (req, res) => {
 app.get('/authorize', (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
   if (response_type !== 'code') return res.status(400).send('unsupported_response_type');
-  const client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
-  if (!client) return res.status(400).send('unknown client_id');
+  if (!client_id) return res.status(400).send('missing client_id');
+
+  // Accept both dynamically-registered clients and manually-entered client_ids
+  // (some MCP clients require a Client ID field and do not perform DCR). If we
+  // have not seen this client_id before, lazily register it with the supplied
+  // redirect_uri so the flow can proceed.
+  let client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
+  if (!client) {
+    db.prepare('INSERT OR IGNORE INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)')
+      .run(client_id, null, JSON.stringify(redirect_uri ? [redirect_uri] : []), now());
+    client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
+  }
 
   const ourState = rand(16);
   db.prepare(
