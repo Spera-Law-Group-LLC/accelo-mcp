@@ -3,7 +3,8 @@ import { config } from './config.js';
 const log = (...a) => console.log(new Date().toISOString(), '[accelo]', ...a);
 
 // Fields we request back from Accelo for quotes. Accelo hides most fields
-// unless explicitly requested via _fields.
+// unless explicitly requested via _fields, and omits null/empty fields from
+// responses.
 const QUOTE_FIELDS = [
   'id', 'title', 'against_type', 'against_id', 'affiliation_id', 'contact_id',
   'manager_id', 'standing', 'date_created', 'date_modified', 'date_issued',
@@ -25,17 +26,16 @@ async function acceloFetch(token, pathname, { method = 'GET', query, body } = {}
     opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     opts.body = new URLSearchParams(body).toString();
   }
-  log('->', method, url.toString(), body ? `body=${opts.body}` : '');
   const res = await fetch(url, opts);
   const text = await res.text();
   let json;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) {
-    log('<-', res.status, 'ERROR body=', text.slice(0, 800));
     const msg = (json && json.meta && json.meta.message) || text;
+    // Log the failing method + path + status + Accelo message (no token/body).
+    log('ERROR', method, pathname, res.status, '-', msg);
     throw new Error(`Accelo API ${method} ${pathname} failed: ${res.status} ${msg}`);
   }
-  log('<-', res.status, 'ok; response keys=', json && json.response ? (Array.isArray(json.response) ? `array[${json.response.length}]` : Object.keys(json.response).join(',')) : 'none');
   return json;
 }
 
