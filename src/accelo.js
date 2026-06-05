@@ -66,3 +66,13 @@ export async function updateQuote(token, id, fields) {
   });
   return json.response;
 }
+
+// Accelo calls deals/sales "prospects". A quote's parent deal is its
+// against_id when against_type == "prospect". _fields=_ALL returns the full
+// deal record (title, value, standing, date_actioned/date_won, etc).
+export async function getDeal(token, id) {
+  const json = await acceloFetch(token, `/prospects/${encodeURIComponent(id)}`, {
+    query: { _fields: '_ALL' },
+  });
+  return json.response;
+}

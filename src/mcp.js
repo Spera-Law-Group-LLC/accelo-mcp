@@ -35,7 +35,7 @@ function needsConfirmation(action, payload) {
 // (i.e. one Accelo user). All Accelo calls run as that user, so Accelo's
 // own permission model is respected.
 export function buildServer(subject) {
-  const server = new McpServer({ name: 'accelo-mcp', version: '0.1.0' });
+  const server = new McpServer({ name: 'accelo-mcp', version: '0.2.0' });
 
   server.tool(
     'list_quotes',
@@ -59,6 +59,16 @@ export function buildServer(subject) {
     async ({ id }) => {
       const token = await getValidAcceloToken(subject);
       return ok(await accelo.getQuote(token, id));
+    }
+  );
+
+  server.tool(
+    'get_deal',
+    'Get a single Accelo deal (a.k.a. sale/prospect) by its ID. Use this to resolve the parent deal of a quote: when a quote has against_type == "prospect", its against_id is the deal ID. Returns the full deal record including title, value, standing, and dates such as date_actioned (when the deal was actioned/won).',
+    { id: z.string().describe("The deal/prospect ID, e.g. a quote's against_id") },
+    async ({ id }) => {
+      const token = await getValidAcceloToken(subject);
+      return ok(await accelo.getDeal(token, id));
     }
   );
 
