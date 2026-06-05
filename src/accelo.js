@@ -4,15 +4,38 @@ const log = (...a) => console.log(new Date().toISOString(), '[accelo]', ...a);
 
 // Fields we request back from Accelo for quotes. Accelo hides most fields
 // unless explicitly requested via _fields, and omits null/empty fields from
-// responses. Includes the client-facing body sections (introduction,
-// conclusion, terms_and_conditions) so reads round-trip what writes can set.
+// responses.
+//
+// READ/WRITE KEY ASYMMETRY (verified against the live API on a draft quote):
+//   - Terms & Conditions:  WRITE `terms_and_conditions`  ->  READ `terms`
+//   - Portal access flag:  WRITE `client_portal_access`  ->  READ `portal_access`
+// We therefore request the READ key names here and normalize the response (see
+// normalizeQuote) so callers see the same field names they wrote. Requesting
+// the write-side names (e.g. `terms_and_conditions`) returns nothing, which is
+// what made a successful T&C write look like a silent drop on verification.
 const QUOTE_FIELDS = [
   'id', 'title', 'against_type', 'against_id', 'affiliation_id', 'contact_id',
   'manager_id', 'standing', 'date_created', 'date_modified', 'date_issued',
   'date_due', 'date_expiry', 'total', 'tax', 'subtotal', 'currency_id',
-  'notes', 'introduction', 'conclusion', 'terms_and_conditions',
-  'client_portal_access',
+  'notes', 'introduction', 'conclusion', 'terms',
+  'portal_access',
 ].join(',');
+
+// Accelo returns some quote fields under different keys than it accepts on
+// write (see QUOTE_FIELDS note). Mirror the write-side aliases onto the read
+// result so round-trip verification works by the same field name the agent
+// set (e.g. an agent that wrote `terms_and_conditions` can read it back under
+// `terms_and_conditions`). The canonical Accelo read keys are preserved too.
+function normalizeQuote(q) {
+  if (!q || typeof q !== 'object') return q;
+  if (q.terms !== undefined && q.terms_and_conditions === undefined) {
+    q.terms_and_conditions = q.terms;
+  }
+  if (q.portal_access !== undefined && q.client_portal_access === undefined) {
+    q.client_portal_access = q.portal_access;
+  }
+  return q;
+}
 
 async function acceloFetch(token, pathname, { method = 'GET', query, body } = {}) {
   const url = new URL(config.acceloBaseUrl + pathname);
@@ -47,19 +70,20 @@ export async function listQuotes(token, { search, limit = 25, page = 0, filters 
   if (search) query._search = search;
   if (filters) query._filters = filters;
   const json = await acceloFetch(token, '/quotes', { query });
-  return json.response;
+  const list = json.response;
+  return Array.isArray(list) ? list.map(normalizeQuote) : list;
 }
 
 export async function getQuote(token, id) {
   const json = await acceloFetch(token, `/quotes/${encodeURIComponent(id)}`, {
     query: { _fields: QUOTE_FIELDS },
   });
-  return json.response;
+  return normalizeQuote(json.response);
 }
 
 export async function createQuote(token, fields) {
   const json = await acceloFetch(token, '/quotes', { method: 'POST', body: fields });
-  return json.response;
+  return normalizeQuote(json.response);
 }
 
 export async function updateQuote(token, id, fields) {
@@ -67,7 +91,7 @@ export async function updateQuote(token, id, fields) {
     method: 'PUT',
     body: fields,
   });
-  return json.response;
+  return normalizeQuote(json.response);
 }
 
 // Accelo calls deals/sales "prospects". A quote's parent deal is its
