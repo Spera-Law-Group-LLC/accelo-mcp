@@ -5,14 +5,14 @@ import { getValidAcceloToken } from './oauth.js';
 // Project-planning module for the Accelo MCP.
 //
 // Phase 1 (read): get_project_plan, list_tasks, get_task.
-// Phase 2 (write): update_task, create_task, update_milestone, delete_task.
+// Phase 2 (write): update_task, create_task, update_milestone, cancel_task.
 //   All writes are confirm:true-guarded and preview a before/after diff first.
 //
 // Kept deliberately self-contained (its own fetch helpers + MCP result helper)
 // so it does not collide with concurrent edits to accelo.js / mcp.js. The only
 // touch-point in mcp.js is a single registerProjectTools(server, subject) call.
 //
-// Accelo model notes (verified live against job 862, 2026-06-03):
+// Accelo model notes (verified live against job 862, 2026-06):
 //   - Job (/jobs/{id}) -> Milestones (/jobs/{id}/milestones) -> Tasks (/tasks).
 //   - A task is attached via against_type/against_id. Usually against a
 //     milestone, but it CAN be against the job directly (not every task has a
@@ -24,12 +24,17 @@ import { getValidAcceloToken } from './oauth.js';
 //     only -- they do NOT cascade downstream tasks.
 //   - Planned schedule = date_started / date_due. Actuals = date_commenced /
 //     date_completed. All dates are Unix timestamps (seconds).
-//   - "Waiting on external party" is a native task_status: 8 = Task for Client,
-//     12 = Task for Third Party.
+//   - Task deletion is NOT supported by the Accelo REST API. "Cancelling" a
+//     task is therefore modeled as a status change to the deployment's inactive
+//     status (task_status 15), which is reversible and visible in the GUI.
+//   - Relevant task_status IDs in this deployment: 8 = Task for Client,
+//     12 = Task for Third Party, 15 = Cancelled/Inactive.
 
 const log = (...a) => console.log(new Date().toISOString(), '[projects]', ...a);
 
 const WAITING_STATUS = { '8': 'Task for Client', '12': 'Task for Third Party' };
+const STATUS_LABELS = { '8': 'Task for Client', '12': 'Task for Third Party', '15': 'Cancelled/Inactive' };
+const CANCELLED_STATUS = '15';
 
 const JOB_FIELDS = [
   'id', 'title', 'standing', 'job_status', 'manager', 'against', 'against_type',
@@ -84,7 +89,7 @@ async function acceloGet(token, pathname, query) {
   return json;
 }
 
-// Write helper for POST/PUT/DELETE. Body is form-urlencoded (Accelo's format).
+// Write helper for POST/PUT. Body is form-urlencoded (Accelo's format).
 async function acceloWrite(token, method, pathname, body) {
   const url = new URL(config.acceloBaseUrl + pathname);
   const opts = {
@@ -131,6 +136,10 @@ function byOrdering(a, b) {
   return Number(a.ordering || 0) - Number(b.ordering || 0);
 }
 
+function statusLabel(s) {
+  return STATUS_LABELS[String(s)] ? `${s} (${STATUS_LABELS[String(s)]})` : String(s);
+}
+
 function decorateTask(t) {
   return {
     id: t.id,
@@ -139,6 +148,7 @@ function decorateTask(t) {
     standing: t.standing,
     task_status: t.task_status,
     waiting_on: WAITING_STATUS[String(t.task_status)] || null,
+    cancelled: String(t.task_status) === CANCELLED_STATUS,
     against_type: t.against_type,
     against_id: t.against_id,
     milestone: t.milestone,
@@ -235,10 +245,7 @@ function buildTaskDiff(current, body) {
     if (isoFields[k]) {
       diff[isoFields[k]] = { from: tsToISO(current[k]), to: tsToISO(to) };
     } else if (k === 'task_status') {
-      diff.task_status = {
-        from: `${current.task_status}${WAITING_STATUS[String(current.task_status)] ? ' (' + WAITING_STATUS[String(current.task_status)] + ')' : ''}`,
-        to: `${to}${WAITING_STATUS[String(to)] ? ' (' + WAITING_STATUS[String(to)] + ')' : ''}`,
-      };
+      diff.task_status = { from: statusLabel(current.task_status), to: statusLabel(to) };
     } else {
       diff[k] = { from: current[k], to };
     }
@@ -302,13 +309,13 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'update_task',
-    'Update a single Accelo task. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff to review with the user; call again with confirm:true to apply. Only the provided fields change. NOTE: this is a single-task edit and does NOT cascade/shift any other tasks. To mark a task as waiting on an external party use task_status 8 (Task for Client) or 12 (Task for Third Party).',
+    'Update a single Accelo task. WRITE OPERATION: requires confirm:true. First call (no confirm) returns a before/after diff to review with the user; call again with confirm:true to apply. Only the provided fields change. NOTE: this is a single-task edit and does NOT cascade/shift any other tasks. task_status reference for this deployment: 8 = Task for Client (waiting), 12 = Task for Third Party (waiting), 15 = Cancelled/Inactive (use cancel_task for that).',
     {
       id: z.string().describe('The task ID to update'),
       title: z.string().optional().describe('New task title'),
       planned_start: z.string().optional().describe('New planned start date as YYYY-MM-DD (or Unix seconds)'),
       planned_due: z.string().optional().describe('New planned due date as YYYY-MM-DD (or Unix seconds)'),
-      task_status: z.string().optional().describe('New task_status ID. 8 = Task for Client (waiting), 12 = Task for Third Party (waiting).'),
+      task_status: z.string().optional().describe('New task_status ID. 8 = Task for Client (waiting), 12 = Task for Third Party (waiting), 15 = Cancelled/Inactive.'),
       confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
     },
     async ({ id, title, planned_start, planned_due, task_status, confirm }) => {
@@ -396,21 +403,24 @@ export function registerProjectTools(server, subject) {
   );
 
   server.tool(
-    'delete_task',
-    'Delete an Accelo task by ID. WRITE OPERATION: requires confirm:true. First call (no confirm) shows what will be deleted; call again with confirm:true to delete. NOTE: the Accelo REST API may not support task deletion; if it returns an error, delete the task in the Accelo GUI or mark it cancelled/complete instead.',
+    'cancel_task',
+    'Cancel an Accelo task by setting it to the inactive status (task_status 15). WRITE OPERATION: requires confirm:true. The Accelo REST API does NOT support deleting tasks, so cancellation is a reversible status change (not a delete) that is visible in the Accelo GUI; reactivate later via update_task with a normal status. Optionally prepends a visible marker to the title so a human can spot it. First call (no confirm) returns a before/after diff; call again with confirm:true to apply.',
     {
-      id: z.string().describe('The task ID to delete'),
-      confirm: z.boolean().optional().describe('Must be true to delete. Omit/false to preview only.'),
+      id: z.string().describe('The task ID to cancel'),
+      mark_title: z.boolean().optional().describe('If true, prepend "[CANCELLED] " to the task title so it is obvious in the GUI. Default false.'),
+      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview the diff only.'),
     },
-    async ({ id, confirm }) => {
+    async ({ id, mark_title, confirm }) => {
       const token = await getValidAcceloToken(subject);
       const current = (await acceloGet(token, `/tasks/${encodeURIComponent(id)}`, { _fields: TASK_FIELDS })).response;
       if (!current) return ok({ status: 'error', message: `Task ${id} not found.` });
-      if (confirm !== true) {
-        return needsConfirmation(`DELETE task ${id} ("${current.title}")`, { delete: { id, title: current.title } });
-      }
-      const res = await acceloWrite(token, 'DELETE', `/tasks/${encodeURIComponent(id)}`);
-      return ok({ status: 'deleted', id, response: res.meta || res });
+      const body = { task_status: CANCELLED_STATUS };
+      const alreadyMarked = String(current.title || '').startsWith('[CANCELLED] ');
+      if (mark_title && !alreadyMarked) body.title = `[CANCELLED] ${current.title}`;
+      const diff = buildTaskDiff(current, body);
+      if (confirm !== true) return needsConfirmation(`CANCEL task ${id} ("${current.title}") by setting it inactive (status 15)`, diff);
+      const res = await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, body);
+      return ok({ status: 'cancelled', task: res.response ? decorateTask(res.response) : res.response, applied: diff });
     }
   );
 }
