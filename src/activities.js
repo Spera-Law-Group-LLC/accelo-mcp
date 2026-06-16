@@ -24,6 +24,9 @@ import { getValidAcceloToken } from './oauth.js';
 //   - OWNER: the activity record itself carries owner_id / owner / owner_type
 //     (the staff member who logged it). There is NO /activities/{id}/interactions
 //     sub-resource (it 400s); owner comes straight off the activity.
+//   - ORDERING: reads are returned NEWEST FIRST (date_logged desc) so agents see
+//     the most recent context at the top. We try the Accelo order filter
+//     order_by_desc(date_logged) and also client-side sort as a guarantee.
 //   - TIME is recorded in SECONDS via `billable` / `nonbillable` (not a flag).
 //     We accept time_minutes and convert (minutes*60) into the chosen bucket.
 //   - Threading: parent_id links a reply to its parent (top-level = 0);
@@ -142,6 +145,15 @@ function secondsToMinutes(s) {
   return Number.isFinite(n) && n > 0 ? Math.round(n / 60) : 0;
 }
 
+// Sort a raw activity list newest-first by date_logged (fallback date_created).
+function sortNewestFirst(list) {
+  return list.sort((a, b) => {
+    const av = Number(a.date_logged || a.date_created || 0);
+    const bv = Number(b.date_logged || b.date_created || 0);
+    return bv - av;
+  });
+}
+
 // Decorate an activity for return. Defaults to body-only (no html_body, no
 // preview_body) to stay token-lean. Pass { includeHtml: true } to also include
 // html_body for callers that explicitly want the rich content.
@@ -172,15 +184,26 @@ function decorateActivity(a, { includeHtml = false } = {}) {
   return out;
 }
 
+// Run the activities list query with the given _filters. Tries to apply the
+// Accelo order filter (newest first); if Accelo rejects that syntax, retries
+// without it. Always returns the raw response array.
+async function listActivitiesRaw(token, filters, limit) {
+  const ordered = `${filters},order_by_desc(date_logged)`;
+  try {
+    const json = await acceloGet(token, '/activities', { _filters: ordered, _fields: ACTIVITY_FIELDS, _limit: limit });
+    return Array.isArray(json.response) ? json.response : [];
+  } catch (e) {
+    // Order-filter syntax not accepted on this deployment -- retry plain.
+    const json = await acceloGet(token, '/activities', { _filters: filters, _fields: ACTIVITY_FIELDS, _limit: limit });
+    return Array.isArray(json.response) ? json.response : [];
+  }
+}
+
 async function fetchActivities(token, againstType, againstId, limit = 50) {
   const type = mapAgainstType(againstType);
-  const json = await acceloGet(token, '/activities', {
-    _filters: `against(${type}(${againstId}))`,
-    _fields: ACTIVITY_FIELDS,
-    _limit: limit,
-  });
-  const list = Array.isArray(json.response) ? json.response : [];
-  return list.map((a) => decorateActivity(a));
+  const list = await listActivitiesRaw(token, `against(${type}(${againstId}))`, limit);
+  // Guarantee newest-first regardless of whether the server-side order took.
+  return sortNewestFirst(list).map((a) => decorateActivity(a));
 }
 
 // Core create. Returns the created activity (decorated) after a re-GET so the
@@ -241,11 +264,11 @@ export function registerActivityTools(server, subject) {
   // -------- Reads --------
   server.tool(
     'list_activities',
-    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object. A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
+    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object, NEWEST FIRST (by date_logged). A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
     {
       against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
-      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50)'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 50)'),
     },
     async ({ against_type, against_id, limit }) => {
       const token = await getValidAcceloToken(subject);
@@ -269,16 +292,15 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'get_activity_thread',
-    'Get all activities in the same thread as the given activity (the conversation/reply chain), body (plaintext) only. Read-only.',
+    'Get all activities in the same thread as the given activity (the conversation/reply chain), NEWEST FIRST, body (plaintext) only. Read-only.',
     { id: z.string().describe('Any activity ID within the thread') },
     async ({ id }) => {
       const token = await getValidAcceloToken(subject);
       const one = (await acceloGet(token, `/activities/${encodeURIComponent(id)}`, { _fields: 'id,thread_id' })).response;
       if (!one) return ok({ status: 'error', message: 'Activity not found' });
       const threadId = one.thread_id || id;
-      const json = await acceloGet(token, '/activities', { _filters: `thread(${threadId})`, _fields: ACTIVITY_FIELDS, _limit: 100 });
-      const list = Array.isArray(json.response) ? json.response : [];
-      return ok({ thread_id: threadId, activities: list.map((a) => decorateActivity(a)) });
+      const list = await listActivitiesRaw(token, `thread(${threadId})`, 100);
+      return ok({ thread_id: threadId, activities: sortNewestFirst(list).map((a) => decorateActivity(a)) });
     }
   );
 
