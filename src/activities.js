@@ -16,6 +16,10 @@ import { getValidAcceloToken } from './oauth.js';
 //   - A "matter" (our legal term) maps to an Accelo JOB or ISSUE. Both are valid
 //     against_type values; LRW-style agents reading a matter's live history pass
 //     against_type "job" or "issue".
+//   - READS ARE FILTERED GETs, not Accelo "search". We use GET /activities with
+//     _filters (against/medium). Accelo's _search (fuzzy full-text) is a
+//     distinct operation and is intentionally NOT used here (see issue #11 for a
+//     future cross-object search tool).
 //   - medium distinguishes the kind: note | email | meeting | call. A NOTE is
 //     internal; an EMAIL can be sent to external affiliations (recipients).
 //   - Content: subject (required) + body (plaintext) or html_body (HTML). We
@@ -42,9 +46,6 @@ import { getValidAcceloToken } from './oauth.js';
 //   - class: provenance/category. THIS DEPLOYMENT: class 13 = "Pushed from
 //     LibreChat" -- used as the default so agent-created activities are
 //     identifiable. (Other classes: 1 Client Work, 2 Sales, 3 Internal, ...)
-//   - FILTER SYNTAX (verified live): owner_id(N), medium(x),
-//     date_created_after(unix), date_created_before(unix); full-text via
-//     _search=...
 //   - owner of agent-created activities is the authenticated staff member
 //     (per-user OAuth) -- not settable.
 //   - Dates are Unix seconds, anchored to the deployment TZ (America/Chicago).
@@ -152,40 +153,6 @@ function tsToISO(ts) {
   }).format(new Date(n * 1000));
 }
 
-// Offset (ms) of TZ at a given UTC instant. Positive = ahead of UTC.
-function tzOffsetMs(utcMs) {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    timeZone: TZ, hour12: false,
-    year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-  });
-  const parts = dtf.formatToParts(new Date(utcMs));
-  const map = {};
-  for (const p of parts) map[p.type] = p.value;
-  const hour = map.hour === '24' ? '00' : map.hour;
-  const asUTC = Date.UTC(map.year, Number(map.month) - 1, map.day, hour, map.minute, map.second);
-  return asUTC - utcMs;
-}
-
-// Convert a YYYY-MM-DD to Unix seconds at a wall-clock time in TZ.
-// endOfDay=true -> 23:59:59 (inclusive "before"); else 00:00:00.
-function dateToUnix(input, endOfDay = false) {
-  if (input === undefined || input === null || input === '') return undefined;
-  const s = String(input).trim();
-  if (/^\d{10}$/.test(s)) return s;
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-  if (!m) {
-    const ms = Date.parse(s);
-    if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
-    throw new Error(`Unrecognized date: "${input}". Use YYYY-MM-DD or Unix seconds.`);
-  }
-  const [, y, mo, d] = m;
-  const hh = endOfDay ? 23 : 0, mm = endOfDay ? 59 : 0, ss = endOfDay ? 59 : 0;
-  const guessUTC = Date.UTC(Number(y), Number(mo) - 1, Number(d), hh, mm, ss);
-  const offset = tzOffsetMs(guessUTC);
-  return String(Math.floor((guessUTC - offset) / 1000));
-}
-
 function secondsToMinutes(s) {
   const n = Number(s);
   return Number.isFinite(n) && n > 0 ? Math.round(n / 60) : 0;
@@ -263,10 +230,9 @@ async function fetchInteracts(token, activityId) {
 
 // Run the activities list query with the given _filters. Tries to apply the
 // Accelo order filter (newest first); if Accelo rejects that syntax, retries
-// without it. Always returns the raw response array. Optional _search string.
-async function listActivitiesRaw(token, filters, limit, search) {
+// without it. Always returns the raw response array.
+async function listActivitiesRaw(token, filters, limit) {
   const base = { _fields: ACTIVITY_FIELDS, _limit: limit };
-  if (search) base._search = search;
   const ordered = filters ? `${filters},order_by_desc(date_logged)` : 'order_by_desc(date_logged)';
   try {
     const json = await acceloGet(token, '/activities', { ...base, _filters: ordered });
@@ -285,18 +251,6 @@ async function fetchActivities(token, againstType, againstId, { medium, limit = 
   if (medium) filters.push(`medium(${medium})`);
   const list = await listActivitiesRaw(token, filters.join(','), limit);
   // Guarantee newest-first regardless of whether the server-side order took.
-  return sortNewestFirst(list).map((a) => decorateActivity(a));
-}
-
-// Deployment-wide search by any combination of filters.
-async function searchActivities(token, { ownerId, medium, againstType, againstId, dateFrom, dateTo, text, limit = 50 }) {
-  const filters = [];
-  if (againstType && againstId) filters.push(`against(${mapAgainstType(againstType)}(${againstId}))`);
-  if (medium) filters.push(`medium(${medium})`);
-  if (ownerId) filters.push(`owner_id(${ownerId})`);
-  if (dateFrom) filters.push(`date_created_after(${dateToUnix(dateFrom, false)})`);
-  if (dateTo) filters.push(`date_created_before(${dateToUnix(dateTo, true)})`);
-  const list = await listActivitiesRaw(token, filters.join(','), limit, text);
   return sortNewestFirst(list).map((a) => decorateActivity(a));
 }
 
@@ -368,31 +322,6 @@ export function registerActivityTools(server, subject) {
     async ({ against_type, against_id, medium, limit }) => {
       const token = await getValidAcceloToken(subject);
       return ok(await fetchActivities(token, against_type, against_id, { medium, limit: limit || 50 }));
-    }
-  );
-
-  server.tool(
-    'search_activities',
-    'Search activities ACROSS the whole Accelo deployment (not just one object), NEWEST FIRST. Combine any of: owner_id (staff who logged it), medium (note|email|meeting|call), against_type+against_id (scope to one object/matter), date_from/date_to (YYYY-MM-DD, deployment timezone), and text (full-text of subject/body). Use for questions like "emails to this client last month", "what did staff 2 log this week", or "activities mentioning \'retainer renewal\'". Returns body (plaintext) only to stay token-lean. Read-only.',
-    {
-      owner_id: z.string().optional().describe('Staff ID who logged the activity'),
-      medium: z.enum(['note', 'email', 'meeting', 'call']).optional().describe('Filter to one medium'),
-      against_type: z.string().optional().describe('Scope to a parent type (job/issue = matter; or task, milestone, deal, quote, company, contact)'),
-      against_id: z.string().optional().describe('Scope to a parent object ID (requires against_type)'),
-      date_from: z.string().optional().describe('Only activities created on/after this date (YYYY-MM-DD)'),
-      date_to: z.string().optional().describe('Only activities created on/before this date (YYYY-MM-DD)'),
-      text: z.string().optional().describe('Full-text search across subject/body'),
-      limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 50)'),
-    },
-    async ({ owner_id, medium, against_type, against_id, date_from, date_to, text, limit }) => {
-      if (against_id && !against_type) {
-        return ok({ status: 'error', message: 'against_id requires against_type.' });
-      }
-      const token = await getValidAcceloToken(subject);
-      return ok(await searchActivities(token, {
-        ownerId: owner_id, medium, againstType: against_type, againstId: against_id,
-        dateFrom: date_from, dateTo: date_to, text, limit: limit || 50,
-      }));
     }
   );
 
