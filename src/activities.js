@@ -2,14 +2,15 @@ import { z } from 'zod';
 import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
 
-// Activities module for the Accelo MCP: push notes / emails / time entries into
-// Accelo and read interaction history, with threading + provenance tagging.
+// Activities module for the Accelo MCP: read interaction history (notes, emails,
+// meetings, calls) and push notes/emails/time into Accelo, with threading,
+// recipient attribution, and provenance tagging.
 //
 // Self-contained (own fetch + result helpers) so it does not collide with
 // concurrent edits to accelo.js / projects.js / mcp.js. The only touch-point in
 // mcp.js is a single registerActivityTools(server, subject) call.
 //
-// Accelo model notes (verified live against job 653, 2026-06):
+// Accelo model notes (verified live against job 653 / email 147, 2026-06):
 //   - Activities are Accelo's universal interaction record (note, email,
 //     meeting, call) and attach to a parent via against_type/against_id.
 //   - A "matter" (our legal term) maps to an Accelo JOB or ISSUE. Both are valid
@@ -20,10 +21,16 @@ import { getValidAcceloToken } from './oauth.js';
 //   - Content: subject (required) + body (plaintext) or html_body (HTML). We
 //     return `body` by default (machines don't need HTML; preview_body is pure
 //     token waste and is never returned). get_activity(include_html:true) adds
-//     html_body for the rare caller that wants the rich content.
-//   - OWNER: the activity record itself carries owner_id / owner / owner_type
-//     (the staff member who logged it). There is NO /activities/{id}/interactions
-//     sub-resource (it 400s); owner comes straight off the activity.
+//     html_body for the rare caller that wants the rich content (often the only
+//     place with real content -- e.g. ~6KB html vs a 443-char plaintext body).
+//   - ATTRIBUTION: the flat owner_id / owner / owner_type is only WHO LOGGED the
+//     activity. The real from/to/cc for an email is the `interacts` sub-resource:
+//       GET /activities/{id}/interacts   (alias: /recipients)  <-- returns 200
+//     NOTE: /activities/{id}/interactions (with the "ion") 400s -- use
+//     "interacts". It returns { staff:[...], contacts:[...] } where each entry
+//     carries interact.type = "from" | "to" | "cc". We normalize into from/to/cc
+//     with name + email. Verified live: email 147 -> from staff al@speralaw.com,
+//     to contact dougm@u2concepts.com.
 //   - ORDERING: reads are returned NEWEST FIRST (date_logged desc) so agents see
 //     the most recent context at the top. We try the Accelo order filter
 //     order_by_desc(date_logged) and also client-side sort as a guarantee.
@@ -35,7 +42,11 @@ import { getValidAcceloToken } from './oauth.js';
 //   - class: provenance/category. THIS DEPLOYMENT: class 13 = "Pushed from
 //     LibreChat" -- used as the default so agent-created activities are
 //     identifiable. (Other classes: 1 Client Work, 2 Sales, 3 Internal, ...)
-//   - owner is the authenticated staff member (per-user OAuth) -- not settable.
+//   - FILTER SYNTAX (verified live): owner_id(N), medium(x),
+//     date_created_after(unix), date_created_before(unix); full-text via
+//     _search=...
+//   - owner of agent-created activities is the authenticated staff member
+//     (per-user OAuth) -- not settable.
 //   - Dates are Unix seconds, anchored to the deployment TZ (America/Chicago).
 
 const log = (...a) => console.log(new Date().toISOString(), '[activities]', ...a);
@@ -44,8 +55,8 @@ const TZ = process.env.ACCELO_TIMEZONE || 'America/Chicago';
 const LIBRECHAT_CLASS_ID = process.env.ACCELO_LIBRECHAT_CLASS_ID || '13';
 
 // Friendly parent names -> Accelo API against_type values. Accelo calls deals
-// "prospects" and quotes are "quotes"; the rest map 1:1. A "matter" is a job or
-// an issue (caller chooses which).
+// "prospects" and contacts "affiliation"; the rest map 1:1. A "matter" is a job
+// or an issue (caller chooses which).
 const AGAINST_TYPE_MAP = {
   task: 'task',
   job: 'job',
@@ -61,6 +72,7 @@ const AGAINST_TYPE_MAP = {
   company: 'company',
   contact: 'affiliation',
   affiliation: 'affiliation',
+  staff: 'staff',
 };
 
 // Fields we request. html_body is requested (so get_activity can surface it on
@@ -140,6 +152,40 @@ function tsToISO(ts) {
   }).format(new Date(n * 1000));
 }
 
+// Offset (ms) of TZ at a given UTC instant. Positive = ahead of UTC.
+function tzOffsetMs(utcMs) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: TZ, hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+  const parts = dtf.formatToParts(new Date(utcMs));
+  const map = {};
+  for (const p of parts) map[p.type] = p.value;
+  const hour = map.hour === '24' ? '00' : map.hour;
+  const asUTC = Date.UTC(map.year, Number(map.month) - 1, map.day, hour, map.minute, map.second);
+  return asUTC - utcMs;
+}
+
+// Convert a YYYY-MM-DD to Unix seconds at a wall-clock time in TZ.
+// endOfDay=true -> 23:59:59 (inclusive "before"); else 00:00:00.
+function dateToUnix(input, endOfDay = false) {
+  if (input === undefined || input === null || input === '') return undefined;
+  const s = String(input).trim();
+  if (/^\d{10}$/.test(s)) return s;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) {
+    const ms = Date.parse(s);
+    if (!Number.isNaN(ms)) return String(Math.floor(ms / 1000));
+    throw new Error(`Unrecognized date: "${input}". Use YYYY-MM-DD or Unix seconds.`);
+  }
+  const [, y, mo, d] = m;
+  const hh = endOfDay ? 23 : 0, mm = endOfDay ? 59 : 0, ss = endOfDay ? 59 : 0;
+  const guessUTC = Date.UTC(Number(y), Number(mo) - 1, Number(d), hh, mm, ss);
+  const offset = tzOffsetMs(guessUTC);
+  return String(Math.floor((guessUTC - offset) / 1000));
+}
+
 function secondsToMinutes(s) {
   const n = Number(s);
   return Number.isFinite(n) && n > 0 ? Math.round(n / 60) : 0;
@@ -184,25 +230,73 @@ function decorateActivity(a, { includeHtml = false } = {}) {
   return out;
 }
 
+// Normalize the interacts/recipients sub-resource into from/to/cc lists. Each
+// person (staff or contact) carries interact.type = from|to|cc.
+function normalizeInteracts(resp) {
+  const out = { from: [], to: [], cc: [], other: [] };
+  if (!resp || typeof resp !== 'object') return out;
+  const take = (arr, kind) => {
+    for (const p of arr || []) {
+      const type = (p.interact && p.interact.type) || 'other';
+      const person = {
+        kind, // 'staff' | 'contact'
+        id: p.id,
+        name: [p.firstname, p.surname].filter(Boolean).join(' ').trim() || p.username || null,
+        email: p.email || null,
+      };
+      (out[type] || out.other).push(person);
+    }
+  };
+  take(resp.staff, 'staff');
+  take(resp.contacts, 'contact');
+  return out;
+}
+
+async function fetchInteracts(token, activityId) {
+  try {
+    const json = await acceloGet(token, `/activities/${encodeURIComponent(activityId)}/interacts`, { _fields: '_ALL', _limit: 50 });
+    return normalizeInteracts(json.response);
+  } catch (e) {
+    return { from: [], to: [], cc: [], other: [], _error: e.message };
+  }
+}
+
 // Run the activities list query with the given _filters. Tries to apply the
 // Accelo order filter (newest first); if Accelo rejects that syntax, retries
-// without it. Always returns the raw response array.
-async function listActivitiesRaw(token, filters, limit) {
-  const ordered = `${filters},order_by_desc(date_logged)`;
+// without it. Always returns the raw response array. Optional _search string.
+async function listActivitiesRaw(token, filters, limit, search) {
+  const base = { _fields: ACTIVITY_FIELDS, _limit: limit };
+  if (search) base._search = search;
+  const ordered = filters ? `${filters},order_by_desc(date_logged)` : 'order_by_desc(date_logged)';
   try {
-    const json = await acceloGet(token, '/activities', { _filters: ordered, _fields: ACTIVITY_FIELDS, _limit: limit });
+    const json = await acceloGet(token, '/activities', { ...base, _filters: ordered });
     return Array.isArray(json.response) ? json.response : [];
   } catch (e) {
     // Order-filter syntax not accepted on this deployment -- retry plain.
-    const json = await acceloGet(token, '/activities', { _filters: filters, _fields: ACTIVITY_FIELDS, _limit: limit });
+    const q = { ...base };
+    if (filters) q._filters = filters;
+    const json = await acceloGet(token, '/activities', q);
     return Array.isArray(json.response) ? json.response : [];
   }
 }
 
-async function fetchActivities(token, againstType, againstId, limit = 50) {
-  const type = mapAgainstType(againstType);
-  const list = await listActivitiesRaw(token, `against(${type}(${againstId}))`, limit);
+async function fetchActivities(token, againstType, againstId, { medium, limit = 50 } = {}) {
+  const filters = [`against(${mapAgainstType(againstType)}(${againstId}))`];
+  if (medium) filters.push(`medium(${medium})`);
+  const list = await listActivitiesRaw(token, filters.join(','), limit);
   // Guarantee newest-first regardless of whether the server-side order took.
+  return sortNewestFirst(list).map((a) => decorateActivity(a));
+}
+
+// Deployment-wide search by any combination of filters.
+async function searchActivities(token, { ownerId, medium, againstType, againstId, dateFrom, dateTo, text, limit = 50 }) {
+  const filters = [];
+  if (againstType && againstId) filters.push(`against(${mapAgainstType(againstType)}(${againstId}))`);
+  if (medium) filters.push(`medium(${medium})`);
+  if (ownerId) filters.push(`owner_id(${ownerId})`);
+  if (dateFrom) filters.push(`date_created_after(${dateToUnix(dateFrom, false)})`);
+  if (dateTo) filters.push(`date_created_before(${dateToUnix(dateTo, true)})`);
+  const list = await listActivitiesRaw(token, filters.join(','), limit, text);
   return sortNewestFirst(list).map((a) => decorateActivity(a));
 }
 
@@ -264,29 +358,71 @@ export function registerActivityTools(server, subject) {
   // -------- Reads --------
   server.tool(
     'list_activities',
-    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object, NEWEST FIRST (by date_logged). A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
+    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object, NEWEST FIRST (by date_logged). A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Optional medium filter (note|email|meeting|call). Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML, or get_activity_recipients for sender/recipients. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
     {
       against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
+      medium: z.enum(['note', 'email', 'meeting', 'call']).optional().describe('Filter to one medium'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 50)'),
     },
-    async ({ against_type, against_id, limit }) => {
+    async ({ against_type, against_id, medium, limit }) => {
       const token = await getValidAcceloToken(subject);
-      return ok(await fetchActivities(token, against_type, against_id, limit || 50));
+      return ok(await fetchActivities(token, against_type, against_id, { medium, limit: limit || 50 }));
+    }
+  );
+
+  server.tool(
+    'search_activities',
+    'Search activities ACROSS the whole Accelo deployment (not just one object), NEWEST FIRST. Combine any of: owner_id (staff who logged it), medium (note|email|meeting|call), against_type+against_id (scope to one object/matter), date_from/date_to (YYYY-MM-DD, deployment timezone), and text (full-text of subject/body). Use for questions like "emails to this client last month", "what did staff 2 log this week", or "activities mentioning \'retainer renewal\'". Returns body (plaintext) only to stay token-lean. Read-only.',
+    {
+      owner_id: z.string().optional().describe('Staff ID who logged the activity'),
+      medium: z.enum(['note', 'email', 'meeting', 'call']).optional().describe('Filter to one medium'),
+      against_type: z.string().optional().describe('Scope to a parent type (job/issue = matter; or task, milestone, deal, quote, company, contact)'),
+      against_id: z.string().optional().describe('Scope to a parent object ID (requires against_type)'),
+      date_from: z.string().optional().describe('Only activities created on/after this date (YYYY-MM-DD)'),
+      date_to: z.string().optional().describe('Only activities created on/before this date (YYYY-MM-DD)'),
+      text: z.string().optional().describe('Full-text search across subject/body'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 50)'),
+    },
+    async ({ owner_id, medium, against_type, against_id, date_from, date_to, text, limit }) => {
+      if (against_id && !against_type) {
+        return ok({ status: 'error', message: 'against_id requires against_type.' });
+      }
+      const token = await getValidAcceloToken(subject);
+      return ok(await searchActivities(token, {
+        ownerId: owner_id, medium, againstType: against_type, againstId: against_id,
+        dateFrom: date_from, dateTo: date_to, text, limit: limit || 50,
+      }));
     }
   );
 
   server.tool(
     'get_activity',
-    'Get a single Accelo activity by ID, with body (plaintext), medium, visibility, class, owner_id, thread/parent linkage, and logged time (minutes). Set include_html:true to also return html_body (the rich email content) -- omit it by default to save tokens. Read-only.',
+    'Get a single Accelo activity by ID, with body (plaintext), medium, visibility, class, owner_id, thread/parent linkage, and logged time (minutes). Set include_html:true to also return html_body (the rich email content). Set include_recipients:true to attach from/to/cc (sender + recipients resolved to names + emails). Both default false to save tokens. Read-only.',
     {
       id: z.string().describe('The activity ID'),
-      include_html: z.boolean().optional().describe('If true, also return html_body (rich email content). Default false (body only).'),
+      include_html: z.boolean().optional().describe('If true, also return html_body (rich email content). Default false.'),
+      include_recipients: z.boolean().optional().describe('If true, attach from/to/cc recipients. Default false.'),
     },
-    async ({ id, include_html }) => {
+    async ({ id, include_html, include_recipients }) => {
       const token = await getValidAcceloToken(subject);
       const json = await acceloGet(token, `/activities/${encodeURIComponent(id)}`, { _fields: ACTIVITY_FIELDS });
-      return ok(json.response ? decorateActivity(json.response, { includeHtml: include_html === true }) : { status: 'error', message: 'Activity not found' });
+      if (!json.response) return ok({ status: 'error', message: 'Activity not found' });
+      const activity = decorateActivity(json.response, { includeHtml: include_html === true });
+      if (include_recipients === true) {
+        activity.recipients = await fetchInteracts(token, id);
+      }
+      return ok(activity);
+    }
+  );
+
+  server.tool(
+    'get_activity_recipients',
+    'Get the sender and recipients of an activity (the interacts sub-resource): from/to/cc resolved to staff/contact names + emails. The flat owner_id on an activity is only who LOGGED it; this is the real email attribution (e.g. who an email was actually sent to/from/cc). Read-only.',
+    { id: z.string().describe('The activity ID') },
+    async ({ id }) => {
+      const token = await getValidAcceloToken(subject);
+      return ok({ activity_id: id, recipients: await fetchInteracts(token, id) });
     }
   );
 
