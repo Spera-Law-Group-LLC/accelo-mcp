@@ -12,9 +12,18 @@ import { getValidAcceloToken } from './oauth.js';
 // Accelo model notes (verified live against job 653, 2026-06):
 //   - Activities are Accelo's universal interaction record (note, email,
 //     meeting, call) and attach to a parent via against_type/against_id.
+//   - A "matter" (our legal term) maps to an Accelo JOB or ISSUE. Both are valid
+//     against_type values; LRW-style agents reading a matter's live history pass
+//     against_type "job" or "issue".
 //   - medium distinguishes the kind: note | email | meeting | call. A NOTE is
 //     internal; an EMAIL can be sent to external affiliations (recipients).
-//   - Content: subject (required) + body (plaintext) or html_body (HTML).
+//   - Content: subject (required) + body (plaintext) or html_body (HTML). We
+//     return `body` by default (machines don't need HTML; preview_body is pure
+//     token waste and is never returned). get_activity(include_html:true) adds
+//     html_body for the rare caller that wants the rich content.
+//   - OWNER: the activity record itself carries owner_id / owner / owner_type
+//     (the staff member who logged it). There is NO /activities/{id}/interactions
+//     sub-resource (it 400s); owner comes straight off the activity.
 //   - TIME is recorded in SECONDS via `billable` / `nonbillable` (not a flag).
 //     We accept time_minutes and convert (minutes*60) into the chosen bucket.
 //   - Threading: parent_id links a reply to its parent (top-level = 0);
@@ -32,11 +41,13 @@ const TZ = process.env.ACCELO_TIMEZONE || 'America/Chicago';
 const LIBRECHAT_CLASS_ID = process.env.ACCELO_LIBRECHAT_CLASS_ID || '13';
 
 // Friendly parent names -> Accelo API against_type values. Accelo calls deals
-// "prospects" and quotes are "quotes"; the rest map 1:1.
+// "prospects" and quotes are "quotes"; the rest map 1:1. A "matter" is a job or
+// an issue (caller chooses which).
 const AGAINST_TYPE_MAP = {
   task: 'task',
   job: 'job',
   project: 'job',
+  matter: 'job',
   milestone: 'milestone',
   issue: 'issue',
   ticket: 'issue',
@@ -49,10 +60,13 @@ const AGAINST_TYPE_MAP = {
   affiliation: 'affiliation',
 };
 
+// Fields we request. html_body is requested (so get_activity can surface it on
+// demand) but preview_body is intentionally NOT requested -- it wastes tokens
+// and we never return it.
 const ACTIVITY_FIELDS = [
-  'id', 'subject', 'body', 'html_body', 'preview_body', 'medium', 'class',
+  'id', 'subject', 'body', 'html_body', 'medium', 'class',
   'visibility', 'confidential', 'against', 'against_type', 'against_id',
-  'owner', 'owner_id', 'parent_id', 'thread_id', 'standing',
+  'owner', 'owner_id', 'owner_type', 'parent_id', 'thread_id', 'standing',
   'billable', 'nonbillable', 'date_created', 'date_started', 'date_ended',
   'date_logged',
 ].join(',');
@@ -128,9 +142,12 @@ function secondsToMinutes(s) {
   return Number.isFinite(n) && n > 0 ? Math.round(n / 60) : 0;
 }
 
-function decorateActivity(a) {
+// Decorate an activity for return. Defaults to body-only (no html_body, no
+// preview_body) to stay token-lean. Pass { includeHtml: true } to also include
+// html_body for callers that explicitly want the rich content.
+function decorateActivity(a, { includeHtml = false } = {}) {
   if (!a || typeof a !== 'object') return a;
-  return {
+  const out = {
     id: a.id,
     subject: a.subject,
     medium: a.medium,
@@ -140,6 +157,7 @@ function decorateActivity(a) {
     against_type: a.against_type,
     against_id: a.against_id,
     owner_id: a.owner_id,
+    owner_type: a.owner_type,
     parent_id: a.parent_id,
     thread_id: a.thread_id,
     billable_minutes: secondsToMinutes(a.billable),
@@ -150,6 +168,8 @@ function decorateActivity(a) {
     date_ended: tsToISO(a.date_ended),
     _raw: { billable: a.billable, nonbillable: a.nonbillable, date_created: a.date_created },
   };
+  if (includeHtml) out.html_body = a.html_body;
+  return out;
 }
 
 async function fetchActivities(token, againstType, againstId, limit = 50) {
@@ -160,7 +180,7 @@ async function fetchActivities(token, againstType, againstId, limit = 50) {
     _limit: limit,
   });
   const list = Array.isArray(json.response) ? json.response : [];
-  return list.map(decorateActivity);
+  return list.map((a) => decorateActivity(a));
 }
 
 // Core create. Returns the created activity (decorated) after a re-GET so the
@@ -221,9 +241,9 @@ export function registerActivityTools(server, subject) {
   // -------- Reads --------
   server.tool(
     'list_activities',
-    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object. Provide against_type (task, job, milestone, issue, deal, quote, company, contact) and against_id. Times are shown in minutes; dates in the deployment timezone. Read-only.',
+    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object. A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
     {
-      against_type: z.string().describe('Parent type: task, job, milestone, issue, deal, quote, company, or contact'),
+      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50)'),
     },
@@ -235,18 +255,21 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'get_activity',
-    'Get a single Accelo activity by ID, with body, medium, visibility, class, thread/parent linkage, and logged time (minutes). Read-only.',
-    { id: z.string().describe('The activity ID') },
-    async ({ id }) => {
+    'Get a single Accelo activity by ID, with body (plaintext), medium, visibility, class, owner_id, thread/parent linkage, and logged time (minutes). Set include_html:true to also return html_body (the rich email content) -- omit it by default to save tokens. Read-only.',
+    {
+      id: z.string().describe('The activity ID'),
+      include_html: z.boolean().optional().describe('If true, also return html_body (rich email content). Default false (body only).'),
+    },
+    async ({ id, include_html }) => {
       const token = await getValidAcceloToken(subject);
       const json = await acceloGet(token, `/activities/${encodeURIComponent(id)}`, { _fields: ACTIVITY_FIELDS });
-      return ok(json.response ? decorateActivity(json.response) : { status: 'error', message: 'Activity not found' });
+      return ok(json.response ? decorateActivity(json.response, { includeHtml: include_html === true }) : { status: 'error', message: 'Activity not found' });
     }
   );
 
   server.tool(
     'get_activity_thread',
-    'Get all activities in the same thread as the given activity (the conversation/reply chain). Read-only.',
+    'Get all activities in the same thread as the given activity (the conversation/reply chain), body (plaintext) only. Read-only.',
     { id: z.string().describe('Any activity ID within the thread') },
     async ({ id }) => {
       const token = await getValidAcceloToken(subject);
@@ -255,7 +278,7 @@ export function registerActivityTools(server, subject) {
       const threadId = one.thread_id || id;
       const json = await acceloGet(token, '/activities', { _filters: `thread(${threadId})`, _fields: ACTIVITY_FIELDS, _limit: 100 });
       const list = Array.isArray(json.response) ? json.response : [];
-      return ok({ thread_id: threadId, activities: list.map(decorateActivity) });
+      return ok({ thread_id: threadId, activities: list.map((a) => decorateActivity(a)) });
     }
   );
 
@@ -264,7 +287,7 @@ export function registerActivityTools(server, subject) {
     'create_activity',
     'Create (push) an activity into Accelo against an object. WRITE OPERATION: requires confirm:true; first call previews, second call with confirm:true applies. medium = note (internal) or email (can target external affiliations). Optional time_minutes logs time (billable by default). Optional parent_id threads this as a reply. Defaults: visibility "all", class 13 (Pushed from LibreChat). Owner is the authenticated user.',
     {
-      against_type: z.string().describe('Parent type: task, job, milestone, issue, deal, quote, company, or contact'),
+      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
       subject: z.string().describe('Activity subject (required by Accelo)'),
       body: z.string().optional().describe('Plaintext body (use html_body for rich email)'),
@@ -294,7 +317,7 @@ export function registerActivityTools(server, subject) {
     'log_note',
     'Convenience tool: log an internal NOTE against an Accelo object. WRITE OPERATION: requires confirm:true (preview first). Notes are internal and never sent externally. Optional time_minutes logs time. Defaults: visibility "all", class 13 (Pushed from LibreChat).',
     {
-      against_type: z.string().describe('Parent type: task, job, milestone, issue, deal, quote, company, or contact'),
+      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
       subject: z.string().describe('Note subject'),
       body: z.string().describe('Note body (plaintext)'),
@@ -314,7 +337,7 @@ export function registerActivityTools(server, subject) {
     'log_email',
     'Convenience tool: log an EMAIL activity against an Accelo object. WRITE OPERATION: requires confirm:true (preview first). Unlike a note, an email medium can be associated with external affiliations. Provide html_body for rich content. Defaults: visibility "all", class 13 (Pushed from LibreChat). NOTE: actual outbound send behavior depends on the Accelo deployment; verify recipients before confirming.',
     {
-      against_type: z.string().describe('Parent type: task, job, milestone, issue, deal, quote, company, or contact'),
+      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
       subject: z.string().describe('Email subject'),
       html_body: z.string().optional().describe('HTML email body'),
@@ -365,7 +388,7 @@ export function registerActivityTools(server, subject) {
     'log_time',
     'Log a time entry against an Accelo object as a note activity. WRITE OPERATION: requires confirm:true (preview first). Use this to record how long work (e.g. a LibreChat session) took: pass time_minutes. The AGENT should compute time_minutes from the conversation (first to last message timestamps) and tell the user the math before confirming. Defaults: billable, visibility "all", class 13 (Pushed from LibreChat).',
     {
-      against_type: z.string().describe('Parent type: task, job, milestone, issue, deal, quote, company, or contact'),
+      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
       subject: z.string().describe('What the time was for'),
       time_minutes: z.number().describe('Minutes of time to log'),
