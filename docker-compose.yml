@@ -6,6 +6,7 @@ services:
     env_file: .env
     ports:
       # Published only on loopback; front with nginx + TLS for the public URL
-      - "127.0.0.1:8787:8787"
+      # NOTE: host port changed from 8787 to 8788 — word-addin-bridge now uses 8787
+      - "127.0.0.1:8788:8787"
     volumes:
       - ./data:/app/data

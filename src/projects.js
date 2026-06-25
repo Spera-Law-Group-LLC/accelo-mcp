@@ -4,7 +4,8 @@ import { getValidAcceloToken } from './oauth.js';
 
 // Project-planning module for the Accelo MCP.
 //
-// Reads:  get_project_plan, list_tasks, get_task, list_task_progressions.
+// Reads:  get_project_plan, list_tasks, get_task, list_task_progressions,
+//         get_project_profile_values, list_project_activities.
 // Writes (confirm:true-guarded): update_task, create_task, progress_task,
 //   cancel_task, reschedule_plan (bulk tasks).
 //
@@ -412,6 +413,42 @@ export function registerProjectTools(server, subject) {
       const token = await getValidAcceloToken(subject);
       const json = await acceloGet(token, `/tasks/${encodeURIComponent(task_id)}/progressions`, { _fields: '_ALL', _limit: 100 });
       return ok(json.response || []);
+    }
+  );
+
+  server.tool(
+    'get_project_profile_values',
+    'Get custom profile field values for a project (job). Returns all profile fields including Project/Issue Folder (a Google Drive URL — extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
+    { job_id: z.string().describe('The Accelo job (project) ID') },
+    async ({ job_id }) => {
+      const token = await getValidAcceloToken(subject);
+      const json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}/profiles/values`, {
+        _limit: 100,
+      });
+      return ok(json.response || []);
+    }
+  );
+
+  server.tool(
+    'list_project_activities',
+    'List recent activities (emails, notes, logged work) against a project (job), newest first. Returns correspondence context: id, subject, date_created, body (email/note text), staff, against_type, against_id. Simpler alternative to list_activities when you already have a job_id. Read-only.',
+    {
+      job_id: z.string().describe('The Accelo job (project) ID'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
+    },
+    async ({ job_id, limit }) => {
+      const token = await getValidAcceloToken(subject);
+      const json = await acceloGet(
+        token,
+        `/jobs/${encodeURIComponent(job_id)}/activities`,
+        {
+          _limit: limit || 25,
+          _order_by: 'date_created desc',
+          _fields: 'id,subject,date_created,body,staff,against_type,against_id',
+        }
+      );
+      const list = Array.isArray(json.response) ? json.response : [];
+      return ok(list);
     }
   );
 
