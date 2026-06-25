@@ -51,10 +51,12 @@ import { getValidAcceloToken } from './oauth.js';
 //     single call.
 //   - ACTIVITIES: the nested /jobs/{id}/activities endpoint does NOT exist in
 //     the Accelo REST API. list_project_activities uses the generic
-//     GET /activities with _filters=against(job(X)). This only captures
-//     activities logged directly against the job -- not against child
-//     milestones/tasks. For comprehensive project activity history, use
-//     DataSights SQL.
+//     GET /activities with _filters=against(job(X)) + fan-out across milestones.
+//     Activities are NEVER filed against_type='task' in this deployment (verified
+//     via DataSights: against_type distribution has 0 task rows), so no task
+//     fan-out is needed. For comprehensive historical analysis, use the
+//     DataSights AcceloActivitiesDetailsAndInteracts view (syncs overnight ~3 AM
+//     CST) which already rolls milestone activities up to the job level.
 
 const log = (...a) => console.log(new Date().toISOString(), '[projects]', ...a);
 
@@ -81,6 +83,12 @@ const TASK_FIELDS = [
   'id', 'title', 'standing', 'status', 'task_status', 'ordering', 'against_type',
   'against_id', 'milestone', 'job', 'assignee', 'manager', 'date_started',
   'date_due', 'date_commenced', 'date_completed', 'description', 'task_priority',
+].join(',');
+
+// Fields for activity queries (lean set — no html_body/preview_body).
+const ACTIVITY_LIST_FIELDS = [
+  'id', 'subject', 'date_created', 'date_logged', 'body', 'medium',
+  'owner_id', 'against_type', 'against_id', 'visibility', 'standing',
 ].join(',');
 
 function ok(data) {
@@ -347,6 +355,33 @@ async function getProjectPlan(token, jobId) {
 }
 
 // ---------------------------------------------------------------------------
+// Activity fan-out helpers
+// ---------------------------------------------------------------------------
+
+// Query activities for a single against_type/against_id with ordering. Tries
+// the server-side order filter; falls back and sorts client-side if rejected.
+async function queryActivitiesFor(token, againstType, againstId, limit) {
+  const filters = `against(${againstType}(${againstId}))`;
+  try {
+    const json = await acceloGet(token, '/activities', {
+      _filters: `${filters},order_by_desc(date_logged)`,
+      _limit: limit,
+      _fields: ACTIVITY_LIST_FIELDS,
+    });
+    return Array.isArray(json.response) ? json.response : [];
+  } catch (e) {
+    // Order filter rejected on this deployment -- retry without.
+    log('order filter rejected for', againstType, againstId, '- retrying:', e.message);
+    const json = await acceloGet(token, '/activities', {
+      _filters: filters,
+      _limit: limit,
+      _fields: ACTIVITY_LIST_FIELDS,
+    });
+    return Array.isArray(json.response) ? json.response : [];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Diff helpers
 // ---------------------------------------------------------------------------
 
@@ -437,42 +472,71 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'list_project_activities',
-    'List recent activities (emails, notes, logged work) logged DIRECTLY against a project (job), newest first. Returns id, subject, date_created, date_logged, body (email/note text), medium, owner_id, against_type, against_id. LIMITATION: only returns activities whose against_type is "job" with against_id matching this job_id. Activities logged against child milestones or tasks within the project are NOT included. For comprehensive project activity history (including milestone/task activities), use DataSights SQL or call list_activities per child object. Read-only.',
+    'List recent activities across an ENTIRE project: the job itself AND all its milestones. Fans out sequentially across the job + each milestone to capture the full activity stream (emails, notes, meetings, calls). Activities in Accelo are never filed against_type="task" in this deployment, so job + milestones covers the complete tree. Returns id, subject, date_created, date_logged, body, medium, owner_id, against_type, against_id, visibility. Deduped by activity_id, newest first. Response includes milestones_scanned count and total_before_limit. Best for recent/today activities (real-time from the API). For comprehensive HISTORICAL analysis, use DataSights SQL with the AcceloActivitiesDetailsAndInteracts view (which already rolls milestone activities up to the job level), but note DataSights syncs overnight ~3 AM CST. Read-only.',
     {
       job_id: z.string().describe('The Accelo job (project) ID'),
-      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max total results after merge (default 25)'),
     },
     async ({ job_id, limit }) => {
       const token = await getValidAcceloToken(subject);
-      const filters = `against(job(${job_id}))`;
       const lim = limit || 25;
-      const fields = 'id,subject,date_created,date_logged,body,medium,owner_id,against_type,against_id';
 
-      // Try with ordering filter first (Accelo syntax varies by deployment);
-      // fall back without ordering and sort client-side.
-      let list;
+      // 1. Get milestone IDs for this job.
+      let milestoneIds = [];
       try {
-        const json = await acceloGet(token, '/activities', {
-          _filters: `${filters},order_by_desc(date_logged)`,
-          _limit: lim,
-          _fields: fields,
+        const msResp = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}/milestones`, {
+          _fields: 'id',
+          _limit: 100,
         });
-        list = Array.isArray(json.response) ? json.response : [];
+        milestoneIds = (Array.isArray(msResp.response) ? msResp.response : []).map((m) => m.id);
       } catch (e) {
-        log('order filter rejected, retrying without:', e.message);
-        const json = await acceloGet(token, '/activities', {
-          _filters: filters,
-          _limit: lim,
-          _fields: fields,
-        });
-        list = Array.isArray(json.response) ? json.response : [];
+        log('milestone fetch failed for job', job_id, '-', e.message);
+        // Continue with job-only if milestone fetch fails.
       }
 
-      // Guarantee newest-first regardless of server-side ordering support.
-      list.sort((a, b) =>
+      // 2. Fan out: job + each milestone (sequential to respect rate limits).
+      const allActivities = [];
+
+      // Job-level activities.
+      try {
+        const jobActs = await queryActivitiesFor(token, 'job', job_id, lim);
+        allActivities.push(...jobActs);
+      } catch (e) {
+        log('job activity query failed for', job_id, '-', e.message);
+      }
+
+      // Milestone-level activities (sequential).
+      for (const msId of milestoneIds) {
+        try {
+          const msActs = await queryActivitiesFor(token, 'milestone', msId, lim);
+          allActivities.push(...msActs);
+        } catch (e) {
+          log('milestone activity query failed for', msId, '-', e.message);
+          // Continue with remaining milestones.
+        }
+      }
+
+      // 3. Dedup by activity_id.
+      const seen = new Set();
+      const deduped = allActivities.filter((a) => {
+        const aid = String(a.id || '');
+        if (!aid || seen.has(aid)) return false;
+        seen.add(aid);
+        return true;
+      });
+
+      // 4. Sort newest-first and truncate.
+      deduped.sort((a, b) =>
         Number(b.date_logged || b.date_created || 0) - Number(a.date_logged || a.date_created || 0)
       );
-      return ok(list);
+
+      return ok({
+        job_id,
+        milestones_scanned: milestoneIds.length,
+        total_before_limit: deduped.length,
+        datasights_note: 'For comprehensive historical analysis, use DataSights SQL: SELECT * FROM AcceloActivitiesDetailsAndInteracts WHERE against_object = \'job\' AND against_id = \'<job_id>\' ORDER BY activity_created_date DESC. DataSights syncs overnight ~3 AM CST.',
+        activities: deduped.slice(0, lim),
+      });
     }
   );
 
