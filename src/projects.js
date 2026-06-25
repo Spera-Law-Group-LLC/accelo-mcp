@@ -49,6 +49,12 @@ import { getValidAcceloToken } from './oauth.js';
 //     (each update = 3 Accelo calls) and stampedes token refresh. For multi-item
 //     changes use reschedule_plan, which processes everything SEQUENTIALLY in a
 //     single call.
+//   - ACTIVITIES: the nested /jobs/{id}/activities endpoint does NOT exist in
+//     the Accelo REST API. list_project_activities uses the generic
+//     GET /activities with _filters=against(job(X)). This only captures
+//     activities logged directly against the job -- not against child
+//     milestones/tasks. For comprehensive project activity history, use
+//     DataSights SQL.
 
 const log = (...a) => console.log(new Date().toISOString(), '[projects]', ...a);
 
@@ -418,7 +424,7 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'get_project_profile_values',
-    'Get custom profile field values for a project (job). Returns all profile fields including Project/Issue Folder (a Google Drive URL — extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
+    'Get custom profile field values for a project (job). Returns all profile fields including Project/Issue Folder (a Google Drive URL \u2014 extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
     { job_id: z.string().describe('The Accelo job (project) ID') },
     async ({ job_id }) => {
       const token = await getValidAcceloToken(subject);
@@ -431,23 +437,41 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'list_project_activities',
-    'List recent activities (emails, notes, logged work) against a project (job), newest first. Returns correspondence context: id, subject, date_created, body (email/note text), staff, against_type, against_id. Simpler alternative to list_activities when you already have a job_id. Read-only.',
+    'List recent activities (emails, notes, logged work) logged DIRECTLY against a project (job), newest first. Returns id, subject, date_created, date_logged, body (email/note text), medium, owner_id, against_type, against_id. LIMITATION: only returns activities whose against_type is "job" with against_id matching this job_id. Activities logged against child milestones or tasks within the project are NOT included. For comprehensive project activity history (including milestone/task activities), use DataSights SQL or call list_activities per child object. Read-only.',
     {
       job_id: z.string().describe('The Accelo job (project) ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
     },
     async ({ job_id, limit }) => {
       const token = await getValidAcceloToken(subject);
-      const json = await acceloGet(
-        token,
-        `/jobs/${encodeURIComponent(job_id)}/activities`,
-        {
-          _limit: limit || 25,
-          _order_by: 'date_created desc',
-          _fields: 'id,subject,date_created,body,staff,against_type,against_id',
-        }
+      const filters = `against(job(${job_id}))`;
+      const lim = limit || 25;
+      const fields = 'id,subject,date_created,date_logged,body,medium,owner_id,against_type,against_id';
+
+      // Try with ordering filter first (Accelo syntax varies by deployment);
+      // fall back without ordering and sort client-side.
+      let list;
+      try {
+        const json = await acceloGet(token, '/activities', {
+          _filters: `${filters},order_by_desc(date_logged)`,
+          _limit: lim,
+          _fields: fields,
+        });
+        list = Array.isArray(json.response) ? json.response : [];
+      } catch (e) {
+        log('order filter rejected, retrying without:', e.message);
+        const json = await acceloGet(token, '/activities', {
+          _filters: filters,
+          _limit: lim,
+          _fields: fields,
+        });
+        list = Array.isArray(json.response) ? json.response : [];
+      }
+
+      // Guarantee newest-first regardless of server-side ordering support.
+      list.sort((a, b) =>
+        Number(b.date_logged || b.date_created || 0) - Number(a.date_logged || a.date_created || 0)
       );
-      const list = Array.isArray(json.response) ? json.response : [];
       return ok(list);
     }
   );

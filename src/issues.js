@@ -14,8 +14,9 @@ import { getValidAcceloToken } from './oauth.js';
 //   - AI Summary, AI Next Steps (field_type: "text")
 //   - Other deployment-specific custom profile fields
 //
-// Activities returned by list_issue_activities use the issue-scoped endpoint
-// GET /issues/{id}/activities (simpler than the global /activities with _filters).
+// Activities are queried via the generic GET /activities endpoint with
+// _filters=against(issue(X)) — the nested /issues/{id}/activities endpoint
+// does not exist in the Accelo REST API.
 
 const log = (...a) => console.log(new Date().toISOString(), '[issues]', ...a);
 
@@ -47,7 +48,7 @@ async function acceloGet(token, pathname, query) {
 export function registerIssueTools(server, subject) {
   server.tool(
     'get_issue_profile_values',
-    'Get custom profile field values for an Accelo issue (ticket). Returns all profile fields including Project/Issue Folder (a Google Drive URL — extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
+    'Get custom profile field values for an Accelo issue (ticket). Returns all profile fields including Project/Issue Folder (a Google Drive URL \u2014 extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
     { issue_id: z.string().describe('The Accelo issue ID') },
     async ({ issue_id }) => {
       const token = await getValidAcceloToken(subject);
@@ -60,23 +61,41 @@ export function registerIssueTools(server, subject) {
 
   server.tool(
     'list_issue_activities',
-    'List recent activities (emails, notes, logged work) against an Accelo issue (ticket), newest first. Returns correspondence context: id, subject, date_created, body (email/note text), staff, against_type, against_id. Simpler alternative to list_activities when you already have an issue_id. Read-only.',
+    'List recent activities (emails, notes, logged work) against an Accelo issue (ticket), newest first. Returns correspondence context: id, subject, date_created, date_logged, body (email/note text), medium, owner_id, against_type, against_id. Uses the generic /activities endpoint with against(issue(X)) filter. Read-only.',
     {
       issue_id: z.string().describe('The Accelo issue ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
     },
     async ({ issue_id, limit }) => {
       const token = await getValidAcceloToken(subject);
-      const json = await acceloGet(
-        token,
-        `/issues/${encodeURIComponent(issue_id)}/activities`,
-        {
-          _limit: limit || 25,
-          _order_by: 'date_created desc',
-          _fields: 'id,subject,date_created,body,staff,against_type,against_id',
-        }
+      const filters = `against(issue(${issue_id}))`;
+      const lim = limit || 25;
+      const fields = 'id,subject,date_created,date_logged,body,medium,owner_id,against_type,against_id';
+
+      // Try with ordering filter first (Accelo syntax varies by deployment);
+      // fall back without ordering and sort client-side.
+      let list;
+      try {
+        const json = await acceloGet(token, '/activities', {
+          _filters: `${filters},order_by_desc(date_logged)`,
+          _limit: lim,
+          _fields: fields,
+        });
+        list = Array.isArray(json.response) ? json.response : [];
+      } catch (e) {
+        log('order filter rejected, retrying without:', e.message);
+        const json = await acceloGet(token, '/activities', {
+          _filters: filters,
+          _limit: lim,
+          _fields: fields,
+        });
+        list = Array.isArray(json.response) ? json.response : [];
+      }
+
+      // Guarantee newest-first regardless of server-side ordering support.
+      list.sort((a, b) =>
+        Number(b.date_logged || b.date_created || 0) - Number(a.date_logged || a.date_created || 0)
       );
-      const list = Array.isArray(json.response) ? json.response : [];
       return ok(list);
     }
   );
