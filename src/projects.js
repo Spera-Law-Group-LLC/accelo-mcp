@@ -475,11 +475,11 @@ export function registerProjectTools(server, subject) {
     'List recent activities across an ENTIRE project: the job itself AND all its milestones. Fans out sequentially across the job + each milestone to capture the full activity stream (emails, notes, meetings, calls). Activities in Accelo are never filed against_type="task" in this deployment, so job + milestones covers the complete tree. Returns id, subject, date_created, date_logged, body, medium, owner_id, against_type, against_id, visibility. Deduped by activity_id, newest first. Response includes milestones_scanned count and total_before_limit. Best for recent/today activities (real-time from the API). For comprehensive HISTORICAL analysis, use DataSights SQL with the AcceloActivitiesDetailsAndInteracts view (which already rolls milestone activities up to the job level), but note DataSights syncs overnight ~3 AM CST. Read-only.',
     {
       job_id: z.string().describe('The Accelo job (project) ID'),
-      limit: z.number().int().min(1).max(100).optional().describe('Max total results after merge (default 25)'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max total results after merge (default 50)'),
     },
     async ({ job_id, limit }) => {
       const token = await getValidAcceloToken(subject);
-      const lim = limit || 25;
+      const lim = limit || 50;
 
       // 1. Get milestone IDs for this job.
       let milestoneIds = [];

@@ -15,7 +15,7 @@ import { getValidAcceloToken } from './oauth.js';
 //   - Other deployment-specific custom profile fields
 //
 // Activities are queried via the generic GET /activities endpoint with
-// _filters=against(issue(X)) — the nested /issues/{id}/activities endpoint
+// _filters=against(issue(X)) \u2014 the nested /issues/{id}/activities endpoint
 // does not exist in the Accelo REST API.
 
 const log = (...a) => console.log(new Date().toISOString(), '[issues]', ...a);
@@ -64,12 +64,12 @@ export function registerIssueTools(server, subject) {
     'List recent activities (emails, notes, logged work) against an Accelo issue (ticket), newest first. Returns correspondence context: id, subject, date_created, date_logged, body (email/note text), medium, owner_id, against_type, against_id. Uses the generic /activities endpoint with against(issue(X)) filter. Read-only.',
     {
       issue_id: z.string().describe('The Accelo issue ID'),
-      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50)'),
     },
     async ({ issue_id, limit }) => {
       const token = await getValidAcceloToken(subject);
       const filters = `against(issue(${issue_id}))`;
-      const lim = limit || 25;
+      const lim = limit || 50;
       const fields = 'id,subject,date_created,date_logged,body,medium,owner_id,against_type,against_id';
 
       // Try with ordering filter first (Accelo syntax varies by deployment);
