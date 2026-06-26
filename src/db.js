@@ -57,12 +57,14 @@ CREATE TABLE IF NOT EXISTS refresh_tokens (
 // ---- Idempotent migrations for existing databases ----
 // CREATE TABLE IF NOT EXISTS will not alter a table that already exists, so add
 // the refresh-token expiry column in place when an older DB is opened.
-function columnExists(table, column) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-  return cols.some((c) => c.name === column);
+// Note: PRAGMA is called with a literal table name (no string interpolation) to
+// avoid any SQL-injection pattern in this security-sensitive path (Gate 2 LOW).
+function refreshTokensHasExpiresAt() {
+  const cols = db.prepare('PRAGMA table_info(refresh_tokens)').all();
+  return cols.some((c) => c.name === 'expires_at');
 }
 
-if (!columnExists('refresh_tokens', 'expires_at')) {
+if (!refreshTokensHasExpiresAt()) {
   db.exec('ALTER TABLE refresh_tokens ADD COLUMN expires_at INTEGER');
 }
 
