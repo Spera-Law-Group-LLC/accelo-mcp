@@ -8,7 +8,13 @@ import { buildServer } from './mcp.js';
 import { exchangeAcceloCode } from './oauth.js';
 
 const app = express();
-app.set('trust proxy', 1); // behind nginx; needed for correct client IP in rate limiting
+// Exactly ONE proxy hop (nginx) sits in front of this service. With trust
+// proxy = 1, Express derives the client IP from the rightmost X-Forwarded-For
+// entry — the address the nearest trusted proxy actually observed. A client-
+// supplied X-Forwarded-For is pushed leftward and ignored, so it cannot be used
+// to forge a fresh rate-limit bucket. Do NOT raise this number unless more
+// trusted hops are added. (Gate 2 #26.)
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -33,7 +39,14 @@ const ACCESS_TTL_MS = 3600 * 1000;
 // ---- Rate limiting (issue #19) --------------------------------------------
 // In-memory store: counters reset on container restart. Acceptable for now;
 // there is no Redis in this service. Tracked as a known residual (F2.4).
-const rlOpts = { windowMs: 15 * 60 * 1000, standardHeaders: true, legacyHeaders: false };
+// keyGenerator uses Express's resolved req.ip (rightmost XFF under trust
+// proxy = 1), so a forged X-Forwarded-For cannot rotate the rate-limit key.
+const rlOpts = {
+  windowMs: 15 * 60 * 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+};
 const registerLimiter = rateLimit({ ...rlOpts, max: 10 });   // DCR is rare
 const authorizeLimiter = rateLimit({ ...rlOpts, max: 30 });  // interactive logins
 const tokenLimiter = rateLimit({ ...rlOpts, max: 60 });
@@ -133,7 +146,7 @@ app.get('/oauth/callback', callbackLimiter, async (req, res) => {
     // Accelo returns error + error_description (state echoed only if supplied)
     if (error) {
       log('[callback] Accelo returned error:', error, error_description || '');
-      return res.status(400).send(`Accelo authorization error: ${error} - ${error_description || ''}`);
+      return res.status(400).send('Authorization was not completed. Please retry.');
     }
 
     // Look up by the state Accelo echoed back. Require an explicit state match;
@@ -173,8 +186,9 @@ app.get('/oauth/callback', callbackLimiter, async (req, res) => {
     log('[callback] authorization complete for a new subject');
     res.redirect(back.toString());
   } catch (e) {
+    // Log detail server-side only; do not leak exception text to the caller (#25).
     log('[callback] ERROR:', e.message);
-    res.status(500).send('OAuth callback error: ' + e.message);
+    res.status(500).send('OAuth callback error. Please retry the authorization.');
   }
 });
 
