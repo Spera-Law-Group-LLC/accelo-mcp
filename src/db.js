@@ -49,8 +49,21 @@ CREATE TABLE IF NOT EXISTS access_tokens (
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   token TEXT PRIMARY KEY,
   subject TEXT NOT NULL,
-  client_id TEXT NOT NULL
+  client_id TEXT NOT NULL,
+  expires_at INTEGER
 );
 `);
+
+// ---- Idempotent migrations for existing databases ----
+// CREATE TABLE IF NOT EXISTS will not alter a table that already exists, so add
+// the refresh-token expiry column in place when an older DB is opened.
+function columnExists(table, column) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  return cols.some((c) => c.name === column);
+}
+
+if (!columnExists('refresh_tokens', 'expires_at')) {
+  db.exec('ALTER TABLE refresh_tokens ADD COLUMN expires_at INTEGER');
+}
 
 export default db;
