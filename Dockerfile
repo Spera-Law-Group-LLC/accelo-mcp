@@ -7,8 +7,9 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY package.json package-lock.json* ./
-RUN npm install --omit=dev
+# Require the committed lockfile (no optional '*') and install from it exactly.
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
 COPY src ./src
 RUN mkdir -p /app/data
