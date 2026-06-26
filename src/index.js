@@ -1,5 +1,6 @@
 import express from 'express';
 import crypto, { randomUUID } from 'node:crypto';
+import rateLimit from 'express-rate-limit';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { config } from './config.js';
 import db from './db.js';
@@ -7,12 +8,23 @@ import { buildServer } from './mcp.js';
 import { exchangeAcceloCode } from './oauth.js';
 
 const app = express();
+// Exactly ONE proxy hop (nginx) sits in front of this service. With trust
+// proxy = 1, Express derives the client IP from the rightmost X-Forwarded-For
+// entry — the address the nearest trusted proxy actually observed. A client-
+// supplied X-Forwarded-For is pushed leftward and ignored, so it cannot be used
+// to forge a fresh rate-limit bucket. Do NOT raise this number unless more
+// trusted hops are added. (Gate 2 #26.)
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const now = () => Date.now();
 const rand = (n = 32) => crypto.randomBytes(n).toString('base64url');
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// Refresh tokens live 90 days and rotate on use.
+const REFRESH_TTL_MS = 90 * 24 * 60 * 60 * 1000;
+const ACCESS_TTL_MS = 3600 * 1000;
 
 // ---------------------------------------------------------------------------
 // This server is an OAuth proxy: it is an Authorization Server to the MCP
@@ -23,6 +35,22 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 // Logging policy: log lifecycle events and errors only. Never log OAuth
 // codes, state values, tokens, or PKCE verifiers.
 // ---------------------------------------------------------------------------
+
+// ---- Rate limiting (issue #19) --------------------------------------------
+// In-memory store: counters reset on container restart. Acceptable for now;
+// there is no Redis in this service. Tracked as a known residual (F2.4).
+// keyGenerator uses Express's resolved req.ip (rightmost XFF under trust
+// proxy = 1), so a forged X-Forwarded-For cannot rotate the rate-limit key.
+const rlOpts = {
+  windowMs: 15 * 60 * 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.ip,
+};
+const registerLimiter = rateLimit({ ...rlOpts, max: 10 });   // DCR is rare
+const authorizeLimiter = rateLimit({ ...rlOpts, max: 30 });  // interactive logins
+const tokenLimiter = rateLimit({ ...rlOpts, max: 60 });
+const callbackLimiter = rateLimit({ ...rlOpts, max: 60 });
 
 // ---- Discovery ----
 app.get('/.well-known/oauth-protected-resource', (_req, res) => {
@@ -46,10 +74,12 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
 });
 
 // ---- Dynamic Client Registration (RFC 7591) ----
-app.post('/register', (req, res) => {
+// Intentionally unauthenticated per spec, but rate-limited to prevent table
+// flooding. redirect_uris registered here are later enforced at /authorize.
+app.post('/register', registerLimiter, (req, res) => {
   const client_id = rand(16);
   const client_secret = rand(24);
-  const redirect_uris = req.body.redirect_uris || [];
+  const redirect_uris = Array.isArray(req.body.redirect_uris) ? req.body.redirect_uris : [];
   db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)')
     .run(client_id, client_secret, JSON.stringify(redirect_uris), now());
   res.status(201).json({
@@ -62,20 +92,36 @@ app.post('/register', (req, res) => {
   });
 });
 
-// ---- Authorize: validate client, stash PKCE/state, bounce to Accelo ----
-app.get('/authorize', (req, res) => {
+// ---- Authorize: validate client + redirect_uri, stash PKCE/state, bounce to Accelo ----
+app.get('/authorize', authorizeLimiter, (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
   if (response_type !== 'code') return res.status(400).send('unsupported_response_type');
   if (!client_id) return res.status(400).send('missing client_id');
+  if (!redirect_uri) return res.status(400).send('missing redirect_uri');
 
   // Accept both dynamically-registered clients and manually-entered client_ids
   // (some MCP clients require a Client ID field and do not perform DCR). If we
-  // have not seen this client_id before, lazily register it with the supplied
-  // redirect_uri so the flow can proceed.
+  // have not seen this client_id before, lazily register it and PIN the supplied
+  // redirect_uri as its sole registered URI.
   let client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
   if (!client) {
     db.prepare('INSERT OR IGNORE INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)')
-      .run(client_id, null, JSON.stringify(redirect_uri ? [redirect_uri] : []), now());
+      .run(client_id, null, JSON.stringify([redirect_uri]), now());
+    client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
+  }
+
+  // SECURITY (#21): the redirect_uri MUST be one of the client's registered
+  // URIs (exact match). Without this, an attacker who registers a client can
+  // point /authorize at their own URL and steal the authorization code.
+  let registered = [];
+  try {
+    registered = JSON.parse(client.redirect_uris || '[]');
+  } catch (e) {
+    registered = [];
+  }
+  if (!Array.isArray(registered) || !registered.includes(redirect_uri)) {
+    log('[authorize] redirect_uri_mismatch for client', client_id);
+    return res.status(400).send('redirect_uri_mismatch');
   }
 
   const ourState = rand(16);
@@ -93,30 +139,27 @@ app.get('/authorize', (req, res) => {
 });
 
 // ---- Accelo redirects back here after the user consents ----
-app.get('/oauth/callback', async (req, res) => {
+app.get('/oauth/callback', callbackLimiter, async (req, res) => {
   try {
     const { code, state, error, error_description } = req.query;
 
     // Accelo returns error + error_description (state echoed only if supplied)
     if (error) {
       log('[callback] Accelo returned error:', error, error_description || '');
-      return res.status(400).send(`Accelo authorization error: ${error} - ${error_description || ''}`);
+      return res.status(400).send('Authorization was not completed. Please retry.');
     }
 
-    // Look up by the state Accelo echoed back. If Accelo omitted state (a known
-    // quirk on some deployments), fall back to the single most-recent pending
-    // auth_state created in the last 10 minutes.
-    let st = state ? db.prepare('SELECT * FROM auth_state WHERE state = ?').get(state) : null;
+    // Look up by the state Accelo echoed back. Require an explicit state match;
+    // the previous "single most-recent pending row" fallback is removed because
+    // it could be polluted by an attacker holding open a pending auth_state.
+    if (!state) {
+      log('[callback] missing state from Accelo');
+      return res.status(400).send('invalid state');
+    }
+    const st = db.prepare('SELECT * FROM auth_state WHERE state = ?').get(state);
     if (!st) {
-      const recent = db.prepare(
-        'SELECT * FROM auth_state WHERE created_at > ? ORDER BY created_at DESC'
-      ).all(now() - 600000);
-      if (!state && recent.length === 1) {
-        st = recent[0];
-      } else {
-        log('[callback] no matching auth_state; pending rows=', recent.length);
-        return res.status(400).send('invalid state');
-      }
+      log('[callback] no matching auth_state');
+      return res.status(400).send('invalid state');
     }
     db.prepare('DELETE FROM auth_state WHERE state = ?').run(st.state);
 
@@ -143,13 +186,14 @@ app.get('/oauth/callback', async (req, res) => {
     log('[callback] authorization complete for a new subject');
     res.redirect(back.toString());
   } catch (e) {
+    // Log detail server-side only; do not leak exception text to the caller (#25).
     log('[callback] ERROR:', e.message);
-    res.status(500).send('OAuth callback error: ' + e.message);
+    res.status(500).send('OAuth callback error. Please retry the authorization.');
   }
 });
 
 // ---- Token endpoint ----
-app.post('/token', (req, res) => {
+app.post('/token', tokenLimiter, (req, res) => {
   const { grant_type, code, code_verifier, refresh_token } = req.body;
 
   if (grant_type === 'authorization_code') {
@@ -165,19 +209,31 @@ app.post('/token', (req, res) => {
     const accessToken = rand(32);
     const refreshToken = rand(32);
     db.prepare('INSERT INTO access_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
-      .run(accessToken, ac.subject, ac.client_id, now() + 3600 * 1000);
-    db.prepare('INSERT INTO refresh_tokens (token, subject, client_id) VALUES (?,?,?)')
-      .run(refreshToken, ac.subject, ac.client_id);
+      .run(accessToken, ac.subject, ac.client_id, now() + ACCESS_TTL_MS);
+    db.prepare('INSERT INTO refresh_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
+      .run(refreshToken, ac.subject, ac.client_id, now() + REFRESH_TTL_MS);
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: refreshToken });
   }
 
   if (grant_type === 'refresh_token') {
     const rt = db.prepare('SELECT * FROM refresh_tokens WHERE token = ?').get(refresh_token);
+    // Reject unknown or expired refresh tokens (expires_at may be NULL on
+    // legacy rows minted before the migration; treat NULL as still-valid once,
+    // then rotate it into an expiring token below).
     if (!rt) return res.status(400).json({ error: 'invalid_grant' });
+    if (rt.expires_at != null && rt.expires_at < now()) {
+      db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(refresh_token);
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token expired' });
+    }
+    // ROTATE: invalidate the presented refresh token and issue a new pair.
+    db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(refresh_token);
     const accessToken = rand(32);
+    const newRefresh = rand(32);
     db.prepare('INSERT INTO access_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
-      .run(accessToken, rt.subject, rt.client_id, now() + 3600 * 1000);
-    return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token });
+      .run(accessToken, rt.subject, rt.client_id, now() + ACCESS_TTL_MS);
+    db.prepare('INSERT INTO refresh_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
+      .run(newRefresh, rt.subject, rt.client_id, now() + REFRESH_TTL_MS);
+    return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: newRefresh });
   }
 
   res.status(400).json({ error: 'unsupported_grant_type' });
@@ -211,6 +267,21 @@ app.post('/mcp', async (req, res) => {
 });
 
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+// ---- Periodic cleanup of expired rows (issue #23) -------------------------
+function cleanupExpired() {
+  const t = now();
+  try {
+    db.prepare('DELETE FROM access_tokens WHERE expires_at < ?').run(t);
+    db.prepare('DELETE FROM refresh_tokens WHERE expires_at IS NOT NULL AND expires_at < ?').run(t);
+    db.prepare('DELETE FROM auth_codes WHERE expires_at < ?').run(t);
+    db.prepare('DELETE FROM auth_state WHERE created_at < ?').run(t - 600000);
+  } catch (e) {
+    log('[cleanup] error:', e.message);
+  }
+}
+cleanupExpired();
+setInterval(cleanupExpired, 60 * 60 * 1000).unref();
 
 app.listen(config.port, '0.0.0.0', () => {
   console.log(`accelo-mcp listening on 0.0.0.0:${config.port}`);
