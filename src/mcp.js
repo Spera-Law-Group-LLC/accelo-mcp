@@ -75,7 +75,7 @@ export function buildServer(subject) {
       search: z.string().optional().describe('Free-text search across the quote title'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
       page: z.number().int().min(0).optional().describe('Zero-based page number'),
-      filters: z.string().optional().describe("Raw Accelo _filters expression, e.g. standing(active)"),
+      filters: z.string().max(500).optional().describe("ADVANCED: raw Accelo _filters expression forwarded verbatim, e.g. standing(active). BYPASSES any structured scoping; max 500 chars."),
     },
     async ({ search, limit, page, filters }) => {
       const token = await getValidAcceloToken(subject);
@@ -154,7 +154,7 @@ export function buildServer(subject) {
   // Activity tools (notes/emails/time, threading, provenance).
   registerActivityTools(server, subject);
 
-  // Issue tools (profile values + scoped activities).
+  // Issue tools (issue records, profile values + scoped activities).
   registerIssueTools(server, subject);
 
   return server;
