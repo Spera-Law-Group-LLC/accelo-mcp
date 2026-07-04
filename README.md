@@ -91,6 +91,12 @@ npm install
 npm start
 ```
 
+> **Deploying an update to the live host?** Follow [`DEPLOY.md`](./DEPLOY.md).
+> The checkout at `/opt/accelo-mcp` is `deploy:deploy`-owned: you must run as the
+> `deploy` user, update with `git merge --ff-only origin/main`, and run the
+> pre/post-build symbol assertions. Container `Up` + `/healthz` ok do **not**
+> prove the new code is actually in the image (see #29).
+
 ## Endpoints
 
 | Path | Purpose |
