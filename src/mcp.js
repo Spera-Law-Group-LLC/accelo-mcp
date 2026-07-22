@@ -2,6 +2,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as accelo from './accelo.js';
 import { getValidAcceloToken } from './oauth.js';
+import { config } from './config.js';
 import { registerProjectTools } from './projects.js';
 import { registerActivityTools } from './activities.js';
 import { registerIssueTools } from './issues.js';
@@ -145,6 +146,73 @@ export function buildServer(subject) {
       if (confirm !== true) return needsConfirmation(`UPDATE quote ${id}`, { id, ...body });
       const token = await getValidAcceloToken(subject);
       return ok(await accelo.updateQuote(token, id, body));
+    }
+  );
+
+  // ---------------------------------------------------------------------------
+  // trigger_quote_template
+  // Called automatically by the Value Price Proposal Drafter agent immediately
+  // after create_quote succeeds. No user confirmation required — it is treated
+  // as part of the quote creation process.
+  //
+  // Security:
+  //   - Auth pre-check via user's OAuth token (getQuote) before launching automation
+  //   - AUTOMATION_KEY lives only in server env (config.automationKey) — never in prompts
+  //   - quote_id is validated as numeric before any I/O
+  // ---------------------------------------------------------------------------
+  server.tool(
+    'trigger_quote_template',
+    'Apply the "Value Price - Three Options + Final Agreement" proposal template to a quote, ' +
+    'then seed the Estimate with the @Value Price Proposal project template. ' +
+    'Call this immediately after create_quote succeeds, before reporting back to the user. ' +
+    'This is automatic — do NOT ask the user for confirmation before calling. ' +
+    'DO NOT RETRY on failure — a partial run may have already mutated the quote. ' +
+    'On failure, report the full error message and the quote_id so the user can complete the remaining steps manually.',
+    {
+      quote_id: z.string().regex(/^\d{1,10}$/).describe(
+        'The Accelo quote ID returned by create_quote. Must be a numeric string.'
+      ),
+    },
+    async ({ quote_id }) => {
+      // Auth pre-check: confirm the calling user can access this quote.
+      // Rejects with a clear error if the quote doesn't exist or isn't accessible.
+      const token = await getValidAcceloToken(subject);
+      try {
+        await accelo.getQuote(token, quote_id);
+      } catch (err) {
+        return ok({
+          status: 'error',
+          message: `Quote ${quote_id} not found or not accessible: ${err.message}`,
+        });
+      }
+
+      const { automationUrl, automationKey } = config;
+      if (!automationKey) {
+        return ok({
+          status: 'error',
+          message:
+            'Automation service key not configured on this server. ' +
+            'Apply the proposal template manually in Accelo for quote ' + quote_id + '.',
+        });
+      }
+
+      try {
+        const resp = await fetch(automationUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Automation-Key': automationKey,
+          },
+          body: JSON.stringify({ actionType: 'set_quote_template', quoteId: quote_id }),
+        });
+        const result = await resp.json().catch(() => ({ status: 'error', message: `HTTP ${resp.status}` }));
+        return ok(result);
+      } catch (err) {
+        return ok({
+          status: 'error',
+          message: `Automation service unreachable: ${err.message}. Apply the template manually in Accelo for quote ${quote_id}.`,
+        });
+      }
     }
   );
 
