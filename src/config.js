@@ -19,4 +19,8 @@ export const config = {
   scope: process.env.OAUTH_SCOPE || 'read(all) write(all)',
   tokenDbPath: process.env.TOKEN_DB_PATH || './data/tokens.db',
   port: parseInt(process.env.PORT || '8787', 10),
+  // Browser automation service (accelo-bot).
+  // Key is required; if unset trigger_quote_template returns a soft error.
+  automationUrl: process.env.AUTOMATION_URL || 'https://ai.speralaw.com/automations/accelo',
+  automationKey: process.env.AUTOMATION_KEY || '',
 };
