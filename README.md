@@ -116,6 +116,13 @@ Add an MCP server pointing at `https://<your-public-host>/mcp` with OAuth
 enabled. LibreChat will discover the OAuth endpoints, register a client, and
 prompt each user to authorize Accelo on first use.
 
+## Rate limits & retry
+
+The Accelo API enforces per-deployment rate limits (HTTP 429). A retry/backoff
+wrapper for the Node.js API client is tracked in [**issue #38**](https://github.com/Spera-Law-Group-LLC/accelo-mcp/issues/38).
+
+→ See the firm's **[Accelo API Guide](https://github.com/Spera-Law-Group-LLC/integrations/blob/main/docs/accelo-api-guide.md)** for the canonical pattern (includes the `X-RateLimit-Reset`-aware Node.js snippet).
+
 ## License
 
 MIT
