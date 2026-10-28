@@ -1,5 +1,6 @@
 services:
   accelo-mcp:
+    mem_limit: 256m
     build: .
     container_name: accelo-mcp
     restart: unless-stopped
