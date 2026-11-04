@@ -68,4 +68,13 @@ if (!refreshTokensHasExpiresAt()) {
   db.exec('ALTER TABLE refresh_tokens ADD COLUMN expires_at INTEGER');
 }
 
+function clientsHasScope() {
+  const cols = db.prepare('PRAGMA table_info(clients)').all();
+  return cols.some((c) => c.name === 'scope');
+}
+
+if (!clientsHasScope()) {
+  db.exec('ALTER TABLE clients ADD COLUMN scope TEXT');
+}
+
 export default db;

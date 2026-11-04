@@ -77,15 +77,21 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
 // Intentionally unauthenticated per spec, but rate-limited to prevent table
 // flooding. redirect_uris registered here are later enforced at /authorize.
 app.post('/register', registerLimiter, (req, res) => {
+  const requestedScope = req.body.scope;
+  if (requestedScope !== undefined && requestedScope !== 'read_only' && requestedScope !== 'full') {
+    return res.status(400).json({ error: 'invalid_client_metadata' });
+  }
+  const scope = requestedScope === undefined ? 'full' : requestedScope;
   const client_id = rand(16);
   const client_secret = rand(24);
   const redirect_uris = Array.isArray(req.body.redirect_uris) ? req.body.redirect_uris : [];
-  db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)')
-    .run(client_id, client_secret, JSON.stringify(redirect_uris), now());
+  db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at, scope) VALUES (?,?,?,?,?)')
+    .run(client_id, client_secret, JSON.stringify(redirect_uris), now(), scope);
   res.status(201).json({
     client_id,
     client_secret,
     redirect_uris,
+    scope,
     token_endpoint_auth_method: 'client_secret_post',
     grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
@@ -262,22 +268,32 @@ function authenticate(req) {
   const auth = req.headers.authorization || '';
   const m = auth.match(/^Bearer (.+)$/);
   if (!m) return null;
-  const row = db.prepare('SELECT * FROM access_tokens WHERE token = ?').get(m[1]);
+  const row = db.prepare(`
+    SELECT access_tokens.subject, access_tokens.expires_at,
+      CASE
+        WHEN clients.client_id IS NULL THEN 'read_only'
+        WHEN clients.scope = 'read_only' THEN 'read_only'
+        ELSE 'full'
+      END AS scope
+    FROM access_tokens
+    LEFT JOIN clients ON clients.client_id = access_tokens.client_id
+    WHERE access_tokens.token = ?
+  `).get(m[1]);
   if (!row || row.expires_at < now()) return null;
-  return row.subject;
+  return { subject: row.subject, scope: row.scope };
 }
 
 // ---- MCP endpoint (stateless: one server/transport per request) ----
 app.post('/mcp', async (req, res) => {
-  const subject = authenticate(req);
-  if (!subject) {
+  const client = authenticate(req);
+  if (!client) {
     res.setHeader(
       'WWW-Authenticate',
       `Bearer resource_metadata="${config.publicBaseUrl}/.well-known/oauth-protected-resource"`
     );
     return res.status(401).json({ error: 'invalid_token' });
   }
-  const server = buildServer(subject);
+  const server = buildServer(client.subject, client.scope);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => { transport.close(); server.close(); });
   await server.connect(transport);
