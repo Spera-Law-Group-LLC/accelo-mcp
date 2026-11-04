@@ -163,42 +163,54 @@ export function registerIssueTools(server, subject) {
 
   server.tool(
     'list_issue_activities',
-    'List recent activities (emails, notes, logged work) against an Accelo issue (ticket), newest first. Returns correspondence context: id, subject, date_created, date_logged, body (email/note text), medium, owner_id, against_type, against_id. Uses the generic /activities endpoint with against(issue(X)) filter. Read-only.',
+    'List activities (emails, notes, logged work) against an Accelo issue (ticket), newest first. Returns { activities, has_more } with correspondence context: id, subject, date_created, date_logged, body (email/note text), medium, owner_id, against_type, against_id. When has_more is true, request page + 1 with the same limit to continue. Uses the generic /activities endpoint with against(issue(X)) filter. Read-only.',
     {
       issue_id: z.string().describe('The Accelo issue ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50)'),
+      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0)'),
     },
-    async ({ issue_id, limit }) => {
+    async ({ issue_id, limit, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
       const filters = `against(issue(${issue_id}))`;
       const lim = limit || 50;
       const fields = 'id,subject,date_created,date_logged,body,medium,owner_id,against_type,against_id';
 
       // Try with ordering filter first (Accelo syntax varies by deployment);
-      // fall back without ordering and sort client-side.
-      let list;
-      try {
-        const json = await acceloGet(token, '/activities', {
-          _filters: `${filters},order_by_desc(date_logged)`,
-          _limit: lim,
-          _fields: fields,
-        });
-        list = Array.isArray(json.response) ? json.response : [];
-      } catch (e) {
-        log('order filter rejected, retrying without:', e.message);
-        const json = await acceloGet(token, '/activities', {
-          _filters: filters,
-          _limit: lim,
-          _fields: fields,
-        });
-        list = Array.isArray(json.response) ? json.response : [];
+      // preserve the upstream page when retrying without ordering.
+      async function fetchPage(upstreamPage) {
+        const base = { _limit: lim + 1, _page: upstreamPage, _fields: fields };
+        try {
+          const json = await acceloGet(token, '/activities', {
+            ...base, _filters: `${filters},order_by_desc(date_logged)`,
+          });
+          return Array.isArray(json.response) ? json.response : [];
+        } catch (e) {
+          log('order filter rejected, retrying without:', e.message);
+          const json = await acceloGet(token, '/activities', {
+            ...base, _filters: filters,
+          });
+          return Array.isArray(json.response) ? json.response : [];
+        }
       }
 
+      // Align limit-sized caller windows with (limit + 1)-sized upstream pages
+      // so the lookahead row is not skipped on the next caller page.
+      const size = lim + 1;
+      const start = page * lim;
+      const upstreamPage = Math.floor(start / size);
+      const offset = start % size;
+      let list = await fetchPage(upstreamPage);
+      if (offset > 0 && list.length === size) {
+        list = list.concat(await fetchPage(upstreamPage + 1));
+      }
+      const window = list.slice(offset, offset + size);
+      const activities = window.slice(0, lim);
+
       // Guarantee newest-first regardless of server-side ordering support.
-      list.sort((a, b) =>
+      activities.sort((a, b) =>
         Number(b.date_logged || b.date_created || 0) - Number(a.date_logged || a.date_created || 0)
       );
-      return ok(list);
+      return ok({ activities, has_more: window.length > lim });
     }
   );
 }

@@ -1,0 +1,144 @@
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { after, test } from 'node:test';
+
+const directory = await mkdtemp(path.join(tmpdir(), 'accelo-mcp-issues-'));
+process.env.PUBLIC_BASE_URL = 'http://127.0.0.1';
+process.env.ACCELO_CLIENT_ID = 'test-client';
+process.env.ACCELO_CLIENT_SECRET = randomBytes(24).toString('base64url');
+process.env.TOKEN_DB_PATH = path.join(directory, 'tokens.db');
+
+const [{ registerIssueTools }, { default: db }] = await Promise.all([
+  import('../src/issues.js'),
+  import('../src/db.js'),
+]);
+
+db.prepare('INSERT INTO accelo_tokens (subject, access_token, expires_at, created_at) VALUES (?,?,?,?)')
+  .run('test-subject', randomBytes(24).toString('base64url'), Date.now() + 3600000, Date.now());
+
+const tools = new Map();
+registerIssueTools({
+  tool(name, description, schema, handler) {
+    tools.set(name, { description, schema, handler });
+  },
+}, 'test-subject');
+
+after(async () => {
+  db.close();
+  await rm(directory, { recursive: true, force: true });
+});
+
+function activities(count) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: String(count - index),
+    subject: 'Synthetic activity',
+    date_logged: String(1700000000 + count - index),
+  }));
+}
+
+function mockAccelo(t, rows, { rejectOrder = false } = {}) {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    assert.ok(url.pathname.endsWith('/activities'));
+    const query = url.searchParams;
+    assert.ok(query.has('_page'));
+    if (rejectOrder && query.get('_filters').includes('order_by_desc')) {
+      return Response.json({ meta: { message: 'Unsupported order filter' } }, { status: 400 });
+    }
+    const limit = Number(query.get('_limit'));
+    const page = Number(query.get('_page'));
+    return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+  });
+  return requests;
+}
+
+async function call(args) {
+  const tool = tools.get('list_issue_activities');
+  for (const [key, schema] of Object.entries(tool.schema)) schema.parse(args[key]);
+  return JSON.parse((await tool.handler(args)).content[0].text);
+}
+
+test('list_issue_activities retrieves >100 rows without gaps or duplicates on both paths', async (t) => {
+  for (const rejectOrder of [false, true]) {
+    await t.test(`rejectOrder=${rejectOrder}`, async (t) => {
+      const rows = activities(305);
+      const requests = mockAccelo(t, rows, { rejectOrder });
+      const received = [];
+      for (let page = 0; page < 4; page++) {
+        const result = await call({ issue_id: '123', limit: 100, page });
+        assert.equal(result.activities.length, page < 3 ? 100 : 5);
+        assert.equal(result.has_more, page < 3);
+        received.push(...result.activities);
+      }
+      assert.deepEqual(received, rows);
+      assert.ok(requests.every((url) => url.searchParams.get('_limit') === '101'));
+      const pages = ['0', '0', '1', '1', '2', '2', '3'];
+      assert.deepEqual(requests.map((url) => url.searchParams.get('_page')),
+        rejectOrder ? pages.flatMap((page) => [page, page]) : pages);
+      for (let index = 0; index < requests.length; index++) {
+        const expected = rejectOrder && index % 2 === 1
+          ? 'against(issue(123))'
+          : 'against(issue(123)),order_by_desc(date_logged)';
+        assert.equal(requests[index].searchParams.get('_filters'), expected);
+      }
+    });
+  }
+});
+
+test('omitting page and limit returns the first 50 activities with an explicit end signal', async (t) => {
+  const rows = activities(50);
+  const requests = mockAccelo(t, rows);
+  const result = await call({ issue_id: '123' });
+  assert.deepEqual(result, { activities: rows, has_more: false });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].searchParams.get('_page'), '0');
+  assert.equal(requests[0].searchParams.get('_limit'), '51');
+});
+
+test('lookahead handles empty, exact, partial, beyond-end, and realigned windows', async (t) => {
+  for (const limit of [1, 2, 50, 100]) {
+    for (const count of [0, 1, limit - 1, limit, limit + 1, 2 * limit, 2 * limit + 1]) {
+      await t.test(`limit=${limit}, count=${count}`, async (t) => {
+        const rows = activities(count);
+        mockAccelo(t, rows);
+        const received = [];
+        for (let page = 0; page <= Math.ceil(count / limit); page++) {
+          const result = await call({ issue_id: '123', limit, page });
+          assert.deepEqual(result.activities, rows.slice(page * limit, (page + 1) * limit));
+          assert.equal(result.has_more, count > (page + 1) * limit);
+          received.push(...result.activities);
+        }
+        assert.deepEqual(received, rows);
+      });
+    }
+  }
+});
+
+test('fallback sorts the returned window newest-first, including date_created fallback', async (t) => {
+  const rows = [
+    { id: '1', date_logged: '100' },
+    { id: '2', date_created: '300' },
+    { id: '3', date_logged: '200' },
+    { id: '4', date_logged: '400' },
+  ];
+  mockAccelo(t, rows, { rejectOrder: true });
+  const result = await call({ issue_id: '123', limit: 3 });
+  assert.deepEqual(result.activities.map((row) => row.id), ['2', '3', '1']);
+  assert.equal(result.has_more, true);
+});
+
+test('issue activity schema validates pages and documents how to continue', () => {
+  const tool = tools.get('list_issue_activities');
+  for (const page of [-1, 0.5, '1']) {
+    assert.equal(tool.schema.page.safeParse(page).success, false);
+  }
+  assert.equal(tool.schema.page.safeParse(undefined).success, true);
+  assert.equal(tool.schema.page.safeParse(0).success, true);
+  assert.match(tool.description, /has_more/);
+  assert.match(tool.description, /page \+ 1/);
+});
