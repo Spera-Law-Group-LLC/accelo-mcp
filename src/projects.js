@@ -360,12 +360,13 @@ async function getProjectPlan(token, jobId) {
 
 // Query activities for a single against_type/against_id with ordering. Tries
 // the server-side order filter; falls back and sorts client-side if rejected.
-async function queryActivitiesFor(token, againstType, againstId, limit) {
+async function queryActivitiesFor(token, againstType, againstId, limit, page) {
   const filters = `against(${againstType}(${againstId}))`;
   try {
     const json = await acceloGet(token, '/activities', {
       _filters: `${filters},order_by_desc(date_logged)`,
       _limit: limit,
+      _page: page,
       _fields: ACTIVITY_LIST_FIELDS,
     });
     return Array.isArray(json.response) ? json.response : [];
@@ -375,10 +376,37 @@ async function queryActivitiesFor(token, againstType, againstId, limit) {
     const json = await acceloGet(token, '/activities', {
       _filters: filters,
       _limit: limit,
+      _page: page,
       _fields: ACTIVITY_LIST_FIELDS,
     });
     return Array.isArray(json.response) ? json.response : [];
   }
+}
+
+async function fetchActivitySource(token, againstType, againstId, needed) {
+  const limit = Math.min(100, needed + 1);
+  const activities = [];
+  let page = 0;
+  let failedPage = null;
+
+  while (activities.length < needed + 1) {
+    try {
+      const rows = await queryActivitiesFor(token, againstType, againstId, limit, page);
+      activities.push(...rows);
+      if (rows.length < limit) break;
+      page += 1;
+    } catch (e) {
+      log('activity query failed for', againstType, againstId, 'page', page, '-', e.message);
+      failedPage = page;
+      break;
+    }
+  }
+
+  return {
+    activities: activities.slice(0, needed),
+    capped: activities.length > needed,
+    failedPage,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -472,47 +500,60 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'list_project_activities',
-    'List recent activities across an ENTIRE project: the job itself AND all its milestones. Fans out sequentially across the job + each milestone to capture the full activity stream (emails, notes, meetings, calls). Activities in Accelo are never filed against_type="task" in this deployment, so job + milestones covers the complete tree. Returns id, subject, date_created, date_logged, body, medium, owner_id, against_type, against_id, visibility. Deduped by activity_id, newest first. Response includes milestones_scanned count and total_before_limit. Best for recent/today activities (real-time from the API). For comprehensive HISTORICAL analysis, use DataSights SQL with the AcceloActivitiesDetailsAndInteracts view (which already rolls milestone activities up to the job level), but note DataSights syncs overnight ~3 AM CST. Read-only.',
+    'List recent activities across an ENTIRE project: the job itself AND all its milestones. Fans out sequentially across the job + each milestone to capture the full activity stream (emails, notes, meetings, calls). Activities in Accelo are never filed against_type="task" in this deployment, so job + milestones covers the complete tree. Returns id, subject, date_created, date_logged, body, medium, owner_id, against_type, against_id, visibility. Deduped by activity_id, newest first. Pages are zero-based (default 0); when has_more is true, request the next page with the same limit. activities_gathered is the deduped prefix fetched through this page\'s lookahead, not a project total; sources_capped names sources with more activities beyond the gathered window, and partial/sources_failed disclose failed sources. Best for recent/today activities (real-time from the API). For comprehensive HISTORICAL analysis, use DataSights SQL with the AcceloActivitiesDetailsAndInteracts view (which already rolls milestone activities up to the job level), but note DataSights syncs overnight ~3 AM CST. Read-only.',
     {
       job_id: z.string().describe('The Accelo job (project) ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max total results after merge (default 50)'),
+      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0)'),
     },
-    async ({ job_id, limit }) => {
+    async ({ job_id, limit, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
       const lim = limit || 50;
+      const start = page * lim;
+      const needed = start + lim + 1;
 
       // 1. Get milestone IDs for this job.
-      let milestoneIds = [];
-      try {
-        const msResp = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}/milestones`, {
-          _fields: 'id',
-          _limit: 100,
-        });
-        milestoneIds = (Array.isArray(msResp.response) ? msResp.response : []).map((m) => m.id);
-      } catch (e) {
-        log('milestone fetch failed for job', job_id, '-', e.message);
-        // Continue with job-only if milestone fetch fails.
+      const milestoneIds = [];
+      const sourcesFailed = [];
+      let milestonePage = 0;
+      while (true) {
+        let milestones;
+        try {
+          const msResp = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}/milestones`, {
+            _fields: 'id',
+            _limit: 100,
+            _page: milestonePage,
+          });
+          milestones = Array.isArray(msResp.response) ? msResp.response : [];
+        } catch (e) {
+          log('milestone fetch failed for job', job_id, 'page', milestonePage, '-', e.message);
+          sourcesFailed.push({ source: `milestones(job:${job_id})`, page: milestonePage });
+          break;
+        }
+        milestoneIds.push(...milestones.map((m) => m.id));
+        if (milestones.length < 100) break;
+        milestonePage += 1;
       }
 
       // 2. Fan out: job + each milestone (sequential to respect rate limits).
       const allActivities = [];
+      const sourcesCapped = [];
 
       // Job-level activities.
-      try {
-        const jobActs = await queryActivitiesFor(token, 'job', job_id, lim);
-        allActivities.push(...jobActs);
-      } catch (e) {
-        log('job activity query failed for', job_id, '-', e.message);
+      const jobSource = await fetchActivitySource(token, 'job', job_id, needed);
+      allActivities.push(...jobSource.activities);
+      if (jobSource.capped) sourcesCapped.push(`job(${job_id})`);
+      if (jobSource.failedPage !== null) {
+        sourcesFailed.push({ source: `job(${job_id})`, page: jobSource.failedPage });
       }
 
       // Milestone-level activities (sequential).
       for (const msId of milestoneIds) {
-        try {
-          const msActs = await queryActivitiesFor(token, 'milestone', msId, lim);
-          allActivities.push(...msActs);
-        } catch (e) {
-          log('milestone activity query failed for', msId, '-', e.message);
-          // Continue with remaining milestones.
+        const msSource = await fetchActivitySource(token, 'milestone', msId, needed);
+        allActivities.push(...msSource.activities);
+        if (msSource.capped) sourcesCapped.push(`milestone(${msId})`);
+        if (msSource.failedPage !== null) {
+          sourcesFailed.push({ source: `milestone(${msId})`, page: msSource.failedPage });
         }
       }
 
@@ -525,17 +566,24 @@ export function registerProjectTools(server, subject) {
         return true;
       });
 
-      // 4. Sort newest-first and truncate.
+      // 4. Sort newest-first and return this page plus a lookahead row.
       deduped.sort((a, b) =>
         Number(b.date_logged || b.date_created || 0) - Number(a.date_logged || a.date_created || 0)
       );
+      const window = deduped.slice(start, start + lim + 1);
 
       return ok({
         job_id,
+        page,
+        limit: lim,
         milestones_scanned: milestoneIds.length,
-        total_before_limit: deduped.length,
+        activities_gathered: deduped.length,
+        has_more: window.length > lim,
+        sources_capped: sourcesCapped,
+        sources_failed: sourcesFailed,
+        partial: sourcesFailed.length > 0,
         datasights_note: 'For comprehensive historical analysis, use DataSights SQL: SELECT * FROM AcceloActivitiesDetailsAndInteracts WHERE against_object = \'job\' AND against_id = \'<job_id>\' ORDER BY activity_created_date DESC. DataSights syncs overnight ~3 AM CST.',
-        activities: deduped.slice(0, lim),
+        activities: window.slice(0, lim),
       });
     }
   );
