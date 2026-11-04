@@ -605,6 +605,41 @@ test('successful registration logs the observed source, client prefix, scope, an
   assert.equal(result.log.split('\n').length, 2);
 });
 
+test('registration logs a forged single-entry XFF separately from the true TCP peer', async () => {
+  const result = await register({ redirect_uris: [redirectUri] }, {
+    'X-Forwarded-For': '203.0.113.9',
+  });
+  assert.equal(result.status, 201);
+  assert.match(result.log, /\[register\] level=info client registered/);
+  assert.match(result.log, /ip="203\.0\.113\.9"/);
+  assert.match(result.log, /peer="(?:::ffff:)?127\.0\.0\.1"/);
+});
+
+test('registration without XFF logs matching client IP and TCP peer', async () => {
+  const start = output.length;
+  const response = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri] }),
+  });
+  assert.equal(response.status, 201);
+  await waitForOutput('\n', start);
+  const log = output.slice(start);
+  assert.match(log, /\[register\] level=info client registered/);
+  assert.match(log, /peer="(?:::ffff:)?127\.0\.0\.1"/);
+  assert.equal(log.match(/ip="([^"]+)"/)[1], log.match(/peer="([^"]+)"/)[1]);
+});
+
+test('rejected registration logs the true TCP peer alongside the forwarded IP', async () => {
+  for (const metadata of [{}, { redirect_uris: [redirectUri], scope: 'unsupported' }]) {
+    const result = await register(metadata, { 'X-Forwarded-For': '203.0.113.9' });
+    assert.equal(result.status, 400);
+    assert.match(result.log, /\[register\] level=warn rejected/);
+    assert.match(result.log, /ip="203\.0\.113\.9"/);
+    assert.match(result.log, /peer="(?:::ffff:)?127\.0\.0\.1"/);
+  }
+});
+
 test('rejected registration logs origin fields and each validation reason', async () => {
   for (const [metadata, reason, origins] of [
     [{ scope: 'unsupported', redirect_uris: [redirectUri] }, 'invalid_client_metadata', 'https://client.example'],
@@ -642,6 +677,7 @@ test('registration strips all C0/C1 controls and neutralizes forged log markers 
     try {
       register({
         body: {}, ip: ${JSON.stringify(ip)},
+        socket: { remoteAddress: ${JSON.stringify(ip)} },
         get: () => ${JSON.stringify(userAgent)},
       }, {
         status(code) { assert.equal(code, 400); return this; },
@@ -655,6 +691,7 @@ test('registration strips all C0/C1 controls and neutralizes forged log markers 
   assert.doesNotMatch(result.stdout.slice(0, -1), /[\u0000-\u001f\u007f-\u009f]/);
   assert.ok(result.stdout.includes('user_agent="agent\\u005bregister] forged line"'));
   assert.ok(result.stdout.includes('ip="198.51.100.200\\u005bregister] forged ip"'));
+  assert.ok(result.stdout.includes('peer="198.51.100.200\\u005bregister] forged ip"'));
 });
 
 test('registration truncates User-Agent to 120 characters after stripping controls in both branches', async () => {
