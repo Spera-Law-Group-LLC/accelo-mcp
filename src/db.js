@@ -31,6 +31,15 @@ CREATE TABLE IF NOT EXISTS auth_state (
   code_challenge_method TEXT,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS consent_requests (
+  consent_id TEXT PRIMARY KEY,
+  client_id TEXT NOT NULL,
+  client_redirect_uri TEXT NOT NULL,
+  client_state TEXT,
+  code_challenge TEXT NOT NULL,
+  code_challenge_method TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS auth_codes (
   code TEXT PRIMARY KEY,
   client_id TEXT NOT NULL,

@@ -15,11 +15,14 @@ This server is an **OAuth proxy**:
   discovery + dynamic client registration + PKCE).
 - To Accelo it acts as an OAuth **client** (authorization-code grant).
 
-The MCP client never sees the Accelo token. When a user authorizes, they are
-bounced to Accelo's consent screen; the resulting Accelo access/refresh tokens
-are stored locally (SQLite) keyed to an opaque subject, and the MCP client is
-handed one of *our* opaque tokens that maps back to it. Accelo tokens are
-refreshed automatically.
+The MCP client never sees the Accelo token. Every authorization first shows a
+consent page on this service with the registered redirect origin and the
+client's registration age. The user must explicitly continue or deny; approval
+is required on every authorization by design, with no remembered-consent
+option. Continuing then redirects to Accelo's own consent screen. The resulting
+Accelo access/refresh tokens are stored locally (SQLite) keyed to an opaque
+subject, and the MCP client is handed one of *our* opaque tokens that maps back
+to it. Accelo tokens are refreshed automatically.
 
 ## Quote fields
 
@@ -105,7 +108,7 @@ npm start
 | `GET /.well-known/oauth-authorization-server` | AS metadata |
 | `GET /.well-known/oauth-protected-resource` | Resource metadata |
 | `POST /register` | Dynamic client registration |
-| `GET /authorize` | Start auth (redirects to Accelo) |
+| `GET /authorize` | Show consent page before authorization continues to Accelo |
 | `GET /oauth/callback` | Accelo redirect target |
 | `POST /token` | Token + refresh |
 | `GET /healthz` | Health check |
@@ -114,7 +117,10 @@ npm start
 
 Add an MCP server pointing at `https://<your-public-host>/mcp` with OAuth
 enabled. LibreChat will discover the OAuth endpoints, register a client, and
-prompt each user to authorize Accelo on first use.
+prompt each user to authorize Accelo on first use. On every authorization, the
+user must also explicitly approve the consent page showing the registered
+redirect origin and client registration age; this is expected behavior and is
+not a failure or a one-time consent.
 
 ## Rate limits & retry
 

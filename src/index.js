@@ -21,6 +21,34 @@ app.use(express.urlencoded({ extended: true }));
 const now = () => Date.now();
 const rand = (n = 32) => crypto.randomBytes(n).toString('base64url');
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+const redirectUriOrigin = (value) => {
+  if (typeof value !== 'string' || value !== value.trim()) return null;
+  try {
+    const url = new URL(value);
+    if ((url.protocol !== 'https:' &&
+         !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) ||
+        url.username || url.password || url.hash) return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+};
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+})[char]);
+const relativeAge = (createdAt) => {
+  const minutes = Math.max(0, Math.floor((now() - createdAt) / 60000));
+  if (minutes < 1) return 'less than a minute ago';
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+};
 
 // Refresh tokens live 90 days and rotate on use.
 const REFRESH_TTL_MS = 90 * 24 * 60 * 60 * 1000;
@@ -77,16 +105,22 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
 // Intentionally unauthenticated per spec, but rate-limited to prevent table
 // flooding. redirect_uris registered here are later enforced at /authorize.
 app.post('/register', registerLimiter, (req, res) => {
-  const requestedScope = req.body.scope;
+  const body = req.body || {};
+  const requestedScope = body.scope;
   if (requestedScope !== undefined && requestedScope !== 'read_only' && requestedScope !== 'full') {
     return res.status(400).json({ error: 'invalid_client_metadata' });
   }
   const scope = requestedScope === undefined ? 'full' : requestedScope;
+  const redirect_uris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
+  if (!redirect_uris.length || redirect_uris.some((uri) => !redirectUriOrigin(uri))) {
+    return res.status(400).json({ error: 'invalid_redirect_uri' });
+  }
   const client_id = rand(16);
   const client_secret = rand(24);
-  const redirect_uris = Array.isArray(req.body.redirect_uris) ? req.body.redirect_uris : [];
   db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at, scope) VALUES (?,?,?,?,?)')
     .run(client_id, client_secret, JSON.stringify(redirect_uris), now(), scope);
+  const hosts = [...new Set(redirect_uris.map((uri) => new URL(uri).host))].join(',');
+  log('[register] client registered for redirect host(s):', hosts);
   res.status(201).json({
     client_id,
     client_secret,
@@ -98,7 +132,57 @@ app.post('/register', registerLimiter, (req, res) => {
   });
 });
 
-// ---- Authorize: validate client + redirect_uri, stash PKCE/state, bounce to Accelo ----
+function renderConsentPage(consentId, redirectOrigin, createdAt) {
+  return `<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorization request</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 0; padding: 2rem; }
+  main { margin: 0 auto; max-width: 36rem; }
+  form { display: flex; flex-direction: column; align-items: flex-start; gap: 1rem; margin-top: 2rem; }
+  button { cursor: pointer; font: inherit; }
+  .deny { background: #24364b; border: 0; border-radius: .3rem; color: white; font-weight: 700; padding: .9rem 1.4rem; }
+  .approve { background: none; border: 0; color: #24364b; padding: .5rem 0; text-decoration: underline; }
+</style>
+</head>
+<body>
+  <main>
+    <h1>Authorization request</h1>
+    <p>An <strong>unverified application</strong> is requesting access to your Accelo account.</p>
+    <p>Redirect origin: <strong>${escapeHtml(redirectOrigin)}</strong></p>
+    <p>Registered ${escapeHtml(relativeAge(createdAt))}.</p>
+    <p>Continue only if you recognize this application and expected this request.</p>
+    <form method="post" action="/authorize/consent">
+      <input type="hidden" name="consent_id" value="${escapeHtml(consentId)}">
+      <button class="deny" type="submit" name="action" value="deny">Deny</button>
+      <button class="approve" type="submit" name="action" value="approve">Continue to Accelo</button>
+    </form>
+  </main>
+</body>
+</html>`;
+}
+
+function setConsentHeaders(res) {
+  res.set({
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'",
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+  });
+}
+
+function buildAcceloAuthorizationUrl(state) {
+  const url = new URL(`${config.acceloOAuthUrl}/authorize`);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('client_id', config.acceloClientId);
+  url.searchParams.set('redirect_uri', config.redirectUri);
+  url.searchParams.set('scope', config.scope);
+  url.searchParams.set('state', state);
+  return url.toString();
+}
+
+// ---- Authorize: validate client + redirect_uri, then require explicit consent ----
 app.get('/authorize', authorizeLimiter, (req, res) => {
   const { client_id, redirect_uri, state, code_challenge, code_challenge_method, response_type } = req.query;
   if (response_type !== 'code') return res.status(400).send('unsupported_response_type');
@@ -130,18 +214,63 @@ app.get('/authorize', authorizeLimiter, (req, res) => {
     return res.status(400).send('invalid_request');
   }
 
+  const redirectOrigin = redirectUriOrigin(redirect_uri);
+  if (!redirectOrigin) return res.status(400).send('redirect_uri_mismatch');
+  const consentId = rand(24);
+  db.prepare(
+    'INSERT INTO consent_requests (consent_id, client_id, client_redirect_uri, client_state, code_challenge, code_challenge_method, created_at) VALUES (?,?,?,?,?,?,?)'
+  ).run(consentId, client_id, redirect_uri, state || null, code_challenge, code_challenge_method || 'S256', now());
+
+  setConsentHeaders(res);
+  res.type('html').status(200).send(renderConsentPage(consentId, redirectOrigin, client.created_at));
+});
+
+app.post('/authorize/consent', authorizeLimiter, (req, res) => {
+  const { consent_id: consentId, action } = req.body || {};
+  if (typeof consentId !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(consentId) ||
+      !['approve', 'deny'].includes(action)) {
+    return res.status(400).send('invalid consent request');
+  }
+
+  const consumeConsentRequest = db.transaction((id) => {
+    const pending = db.prepare('SELECT * FROM consent_requests WHERE consent_id = ?').get(id);
+    if (pending) db.prepare('DELETE FROM consent_requests WHERE consent_id = ?').run(id);
+    return pending;
+  });
+  const pending = consumeConsentRequest(consentId);
+  if (!pending || pending.created_at <= now() - 600000) {
+    return res.status(400).send('invalid or expired consent request');
+  }
+
+  const client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(pending.client_id);
+  let registered = [];
+  try {
+    registered = JSON.parse(client?.redirect_uris || '[]');
+  } catch {
+    registered = [];
+  }
+  if (!client || !Array.isArray(registered) || !registered.includes(pending.client_redirect_uri) ||
+      !redirectUriOrigin(pending.client_redirect_uri)) {
+    return res.status(400).send('invalid consent request');
+  }
+
+  const redirect = new URL(pending.client_redirect_uri);
+  if (action === 'deny') {
+    redirect.searchParams.set('error', 'access_denied');
+    if (pending.client_state) redirect.searchParams.set('state', pending.client_state);
+    log('[authorize] consent denied for redirect host:', redirect.host);
+    return res.redirect(redirect.toString());
+  }
+
   const ourState = rand(16);
   db.prepare(
     'INSERT INTO auth_state (state, client_id, client_redirect_uri, client_state, code_challenge, code_challenge_method, created_at) VALUES (?,?,?,?,?,?,?)'
-  ).run(ourState, client_id, redirect_uri, state || null, code_challenge, code_challenge_method || 'S256', now());
-
-  const u = new URL(`${config.acceloOAuthUrl}/authorize`);
-  u.searchParams.set('response_type', 'code');
-  u.searchParams.set('client_id', config.acceloClientId);
-  u.searchParams.set('redirect_uri', config.redirectUri);
-  u.searchParams.set('scope', config.scope);
-  u.searchParams.set('state', ourState);
-  res.redirect(u.toString());
+  ).run(
+    ourState, pending.client_id, pending.client_redirect_uri, pending.client_state,
+    pending.code_challenge, pending.code_challenge_method || 'S256', now(),
+  );
+  log('[authorize] consent granted for redirect host:', redirect.host);
+  res.redirect(buildAcceloAuthorizationUrl(ourState));
 });
 
 // ---- Accelo redirects back here after the user consents ----
@@ -310,6 +439,7 @@ function cleanupExpired() {
     db.prepare('DELETE FROM refresh_tokens WHERE expires_at IS NOT NULL AND expires_at < ?').run(t);
     db.prepare('DELETE FROM auth_codes WHERE expires_at < ?').run(t);
     db.prepare('DELETE FROM auth_state WHERE created_at < ?').run(t - 600000);
+    db.prepare('DELETE FROM consent_requests WHERE created_at < ?').run(t - 600000);
   } catch (e) {
     log('[cleanup] error:', e.message);
   }
