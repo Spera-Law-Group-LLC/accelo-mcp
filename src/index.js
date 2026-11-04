@@ -100,7 +100,7 @@ app.post('/register', registerLimiter, (req, res) => {
     .replace(/\[/g, '\\u005b').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
   const origins = [...new Set((Array.isArray(body.redirect_uris) ? body.redirect_uris : [])
     .map((uri) => redirectUriOrigin(uri) || '(invalid)'))].join(',') || '(none)';
-  const originFields = `ip=${headerField(req.ip)} user_agent=${headerField(req.get('user-agent'))} redirect_origins=${origins}`;
+  const originFields = `ip=${headerField(req.ip)} user_agent=${headerField(req.get('user-agent'))} redirect_origins=${origins} peer=${headerField(req.socket.remoteAddress)}`;
   const requestedScope = body.scope;
   if (requestedScope !== undefined && requestedScope !== 'read_only' && requestedScope !== 'full') {
     log('[register] level=warn rejected reason=invalid_client_metadata', originFields);
