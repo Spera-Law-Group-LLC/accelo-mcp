@@ -231,8 +231,8 @@ async function fetchInteracts(token, activityId) {
 // Run the activities list query with the given _filters. Tries to apply the
 // Accelo order filter (newest first); if Accelo rejects that syntax, retries
 // without it. Always returns the raw response array.
-async function listActivitiesRaw(token, filters, limit) {
-  const base = { _fields: ACTIVITY_FIELDS, _limit: limit };
+async function listActivitiesRaw(token, filters, limit, page = 0) {
+  const base = { _fields: ACTIVITY_FIELDS, _limit: limit, _page: page };
   const ordered = filters ? `${filters},order_by_desc(date_logged)` : 'order_by_desc(date_logged)';
   try {
     const json = await acceloGet(token, '/activities', { ...base, _filters: ordered });
@@ -246,12 +246,28 @@ async function listActivitiesRaw(token, filters, limit) {
   }
 }
 
-async function fetchActivities(token, againstType, againstId, { medium, limit = 50 } = {}) {
+async function fetchActivityPage(token, filters, limit, page = 0) {
+  // _page offsets depend on _limit. Align the caller's limit-sized window with
+  // upstream (limit + 1)-sized pages so the lookahead row is never skipped.
+  const size = limit + 1;
+  const start = page * limit;
+  const upstreamPage = Math.floor(start / size);
+  const offset = start % size;
+  let list = await listActivitiesRaw(token, filters, size, upstreamPage);
+  if (offset > 0 && list.length === size) {
+    list = list.concat(await listActivitiesRaw(token, filters, size, upstreamPage + 1));
+  }
+  const window = list.slice(offset, offset + size);
+  return {
+    activities: sortNewestFirst(window.slice(0, limit)).map((a) => decorateActivity(a)),
+    has_more: window.length > limit,
+  };
+}
+
+async function fetchActivities(token, againstType, againstId, { medium, limit = 50, page = 0 } = {}) {
   const filters = [`against(${mapAgainstType(againstType)}(${againstId}))`];
   if (medium) filters.push(`medium(${medium})`);
-  const list = await listActivitiesRaw(token, filters.join(','), limit);
-  // Guarantee newest-first regardless of whether the server-side order took.
-  return sortNewestFirst(list).map((a) => decorateActivity(a));
+  return fetchActivityPage(token, filters.join(','), limit, page);
 }
 
 // Core create. Returns the created activity (decorated) after a re-GET so the
@@ -312,16 +328,17 @@ export function registerActivityTools(server, subject) {
   // -------- Reads --------
   server.tool(
     'list_activities',
-    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object, NEWEST FIRST (by date_logged). A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Optional medium filter (note|email|meeting|call). Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML, or get_activity_recipients for sender/recipients. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
+    'List the activity history (notes, emails, meetings, calls) logged against an Accelo object, NEWEST FIRST (by date_logged). A "matter" is a job or an issue -- pass against_type "job" or "issue" with the matter ID. Other parents: task, milestone, deal, quote, company, contact. Optional medium filter (note|email|meeting|call). Returns { activities, has_more }; when has_more is true, request page + 1 with the same limit and filters to continue. Pages are zero-based (default 0). Returns body (plaintext) only -- not html_body -- to stay token-lean; use get_activity(include_html:true) for an email\'s rich HTML, or get_activity_recipients for sender/recipients. Each item includes owner_id, medium, billable/nonbillable minutes, thread linkage, and dates in the deployment timezone. Read-only.',
     {
       against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
       against_id: z.string().describe('ID of the parent object'),
       medium: z.enum(['note', 'email', 'meeting', 'call']).optional().describe('Filter to one medium'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 50)'),
+      page: z.number().int().min(0).optional().describe('Zero-based page number'),
     },
-    async ({ against_type, against_id, medium, limit }) => {
+    async ({ against_type, against_id, medium, limit, page }) => {
       const token = await getValidAcceloToken(subject);
-      return ok(await fetchActivities(token, against_type, against_id, { medium, limit: limit || 50 }));
+      return ok(await fetchActivities(token, against_type, against_id, { medium, limit: limit || 50, page }));
     }
   );
 
@@ -357,15 +374,18 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'get_activity_thread',
-    'Get all activities in the same thread as the given activity (the conversation/reply chain), NEWEST FIRST, body (plaintext) only. Read-only.',
-    { id: z.string().describe('Any activity ID within the thread') },
-    async ({ id }) => {
+    'Get a page of activities in the same thread as the given activity (the conversation/reply chain), NEWEST FIRST, body (plaintext) only. Returns { thread_id, activities, has_more }; when has_more is true, request page + 1 with the same id and limit to continue. Pages are zero-based (default 0). Read-only.',
+    {
+      id: z.string().describe('Any activity ID within the thread'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 100)'),
+      page: z.number().int().min(0).optional().describe('Zero-based page number'),
+    },
+    async ({ id, limit = 100, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
       const one = (await acceloGet(token, `/activities/${encodeURIComponent(id)}`, { _fields: 'id,thread_id' })).response;
       if (!one) return ok({ status: 'error', message: 'Activity not found' });
       const threadId = one.thread_id || id;
-      const list = await listActivitiesRaw(token, `thread(${threadId})`, 100);
-      return ok({ thread_id: threadId, activities: sortNewestFirst(list).map((a) => decorateActivity(a)) });
+      return ok({ thread_id: threadId, ...await fetchActivityPage(token, `thread(${threadId})`, limit, page) });
     }
   );
 
