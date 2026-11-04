@@ -108,7 +108,7 @@ after(async () => {
 });
 
 beforeEach(() => {
-  for (const table of ['clients', 'auth_state', 'auth_codes', 'access_tokens', 'refresh_tokens', 'accelo_tokens']) {
+  for (const table of ['clients', 'auth_state', 'consent_requests', 'auth_codes', 'access_tokens', 'refresh_tokens', 'accelo_tokens']) {
     db.prepare(`DELETE FROM ${table}`).run();
   }
   const insert = db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)');
@@ -127,6 +127,19 @@ function authorize(overrides = {}) {
     if (params[key] === undefined) delete params[key];
   }
   return fetch(`${baseUrl}/authorize?${new URLSearchParams(params)}`, { redirect: 'manual' });
+}
+
+async function consent(response, action = 'approve') {
+  const html = await response.text();
+  const match = html.match(/name="consent_id" value="([A-Za-z0-9_-]+)"/);
+  assert.ok(match, 'consent page includes its hidden consent id');
+  const submitted = await fetch(`${baseUrl}/authorize/consent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ consent_id: match[1], action }),
+    redirect: 'manual',
+  });
+  return { consentId: match[1], response: submitted };
 }
 
 function token(body) {
@@ -187,7 +200,26 @@ test('unknown authorization client is rejected without changing clients or auth 
   assert.deepEqual(await response.json(), { error: 'unauthorized_client' });
   assert.deepEqual(db.prepare('SELECT * FROM clients ORDER BY client_id').all(), clients);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
 });
+
+for (const [name, metadata] of [
+  ['missing redirect URIs', {}],
+  ['empty redirect URIs', { redirect_uris: [] }],
+  ['empty redirect URI', { redirect_uris: [''] }],
+  ['invalid redirect scheme', { redirect_uris: ['javascript:alert(1)'] }],
+]) {
+  test(`dynamic registration rejects ${name}`, async () => {
+    const response = await fetch(`${baseUrl}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(metadata),
+    });
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: 'invalid_redirect_uri' });
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM clients').get().count, 4);
+  });
+}
 
 for (const [name, params] of [
   ['missing challenge', { code_challenge: undefined }],
@@ -200,6 +232,7 @@ for (const [name, params] of [
     assert.equal(response.status, 400);
     assert.equal(await response.text(), 'invalid_request');
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
   });
 }
 
@@ -209,13 +242,74 @@ test('registered redirect matching is still exact', async () => {
   assert.equal(await response.text(), 'redirect_uri_mismatch');
 });
 
-test('omitted challenge method defaults to S256 and is stored', async () => {
+test('authorize renders consent without reaching Accelo and defaults the stored challenge method to S256', async () => {
   const response = await authorize({ code_challenge_method: undefined });
-  assert.equal(response.status, 302);
-  const state = new URL(response.headers.get('location')).searchParams.get('state');
-  const row = db.prepare('SELECT * FROM auth_state WHERE state = ?').get(state);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('location'), null);
+  assert.equal(response.headers.get('content-type'), 'text/html; charset=utf-8');
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  assert.equal(response.headers.get('x-frame-options'), 'DENY');
+  assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
+  const html = await response.text();
+  assert.match(html, /unverified application/i);
+  assert.match(html, /https:\/\/client\.example/);
+  assert.match(html, /Registered less than a minute ago/);
+  assert.ok(!html.includes(clientId), 'opaque client id is not shown to the user');
+  const row = db.prepare('SELECT * FROM consent_requests').get();
   assert.equal(row.code_challenge, challenge);
   assert.equal(row.code_challenge_method, 'S256');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+});
+
+test('consent approval is single-use and only then creates auth state for the Accelo redirect', async () => {
+  const authorization = await authorize({ state: 'test-client-state' });
+  assert.equal(authorization.status, 200);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+  const { consentId, response: approved } = await consent(authorization);
+  assert.equal(approved.status, 302);
+  const acceloUrl = new URL(approved.headers.get('location'));
+  assert.equal(acceloUrl.origin, `http://127.0.0.1:${upstream.address().port}`);
+  const state = acceloUrl.searchParams.get('state');
+  const row = db.prepare('SELECT * FROM auth_state WHERE state = ?').get(state);
+  assert.equal(row.client_id, clientId);
+  assert.equal(row.client_state, 'test-client-state');
+  assert.equal(row.code_challenge_method, 'S256');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
+  assert.equal((await fetch(`${baseUrl}/authorize/consent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ consent_id: consentId, action: 'approve' }),
+    redirect: 'manual',
+  })).status, 400);
+});
+
+test('consent denial redirects with access_denied and never creates auth state', async () => {
+  const authorization = await authorize({ state: 'denied-state' });
+  const { response: denied } = await consent(authorization, 'deny');
+  assert.equal(denied.status, 302);
+  const destination = new URL(denied.headers.get('location'));
+  assert.equal(destination.origin + destination.pathname, redirectUri);
+  assert.equal(destination.searchParams.get('error'), 'access_denied');
+  assert.equal(destination.searchParams.get('state'), 'denied-state');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
+});
+
+test('expired consent requests cannot create auth state', async () => {
+  const authorization = await authorize();
+  const html = await authorization.text();
+  const consentId = html.match(/name="consent_id" value="([A-Za-z0-9_-]+)"/)[1];
+  db.prepare('UPDATE consent_requests SET created_at = ? WHERE consent_id = ?').run(Date.now() - 600001, consentId);
+  const response = await fetch(`${baseUrl}/authorize/consent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ consent_id: consentId, action: 'approve' }),
+  });
+  assert.equal(response.status, 400);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
 });
 
 for (const grant of ['authorization_code', 'refresh_token']) {
@@ -305,8 +399,11 @@ test('registered confidential client completes PKCE authorization, callback, red
   assert.equal(client.scope, 'full');
   assert.equal(client.token_endpoint_auth_method, 'client_secret_post');
   const authorization = await authorize({ client_id: client.client_id, state: 'test-client-state' });
-  assert.equal(authorization.status, 302);
-  const state = new URL(authorization.headers.get('location')).searchParams.get('state');
+  assert.equal(authorization.status, 200);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+  const { response: approved } = await consent(authorization);
+  assert.equal(approved.status, 302);
+  const state = new URL(approved.headers.get('location')).searchParams.get('state');
   const callback = await fetch(`${baseUrl}/oauth/callback?${new URLSearchParams({ state, code: 'mock-accelo-code' })}`, {
     redirect: 'manual',
   });
