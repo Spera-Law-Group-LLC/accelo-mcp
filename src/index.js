@@ -95,21 +95,28 @@ app.get('/.well-known/oauth-authorization-server', (_req, res) => {
 // flooding. redirect_uris registered here are later enforced at /authorize.
 app.post('/register', registerLimiter, (req, res) => {
   const body = req.body || {};
+  const headerField = (value) => JSON.stringify(String(value ?? '-')
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 120))
+    .replace(/\[/g, '\\u005b').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  const origins = [...new Set((Array.isArray(body.redirect_uris) ? body.redirect_uris : [])
+    .map((uri) => redirectUriOrigin(uri) || '(invalid)'))].join(',') || '(none)';
+  const originFields = `ip=${headerField(req.ip)} user_agent=${headerField(req.get('user-agent'))} redirect_origins=${origins}`;
   const requestedScope = body.scope;
   if (requestedScope !== undefined && requestedScope !== 'read_only' && requestedScope !== 'full') {
+    log('[register] level=warn rejected reason=invalid_client_metadata', originFields);
     return res.status(400).json({ error: 'invalid_client_metadata' });
   }
   const scope = requestedScope === undefined ? 'full' : requestedScope;
   const redirect_uris = Array.isArray(body.redirect_uris) ? body.redirect_uris : [];
   if (!redirect_uris.length || redirect_uris.some((uri) => !redirectUriOrigin(uri))) {
+    log('[register] level=warn rejected reason=invalid_redirect_uri', originFields);
     return res.status(400).json({ error: 'invalid_redirect_uri' });
   }
   const client_id = rand(16);
   const client_secret = rand(24);
   db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at, scope) VALUES (?,?,?,?,?)')
     .run(client_id, client_secret, JSON.stringify(redirect_uris), now(), scope);
-  const hosts = [...new Set(redirect_uris.map((uri) => new URL(uri).host))].join(',');
-  log('[register] client registered for redirect host(s):', hosts);
+  log('[register] level=info client registered', originFields, `client_id=${client_id.slice(0, 8)} scope=${scope}`);
   res.status(201).json({
     client_id,
     client_secret,
