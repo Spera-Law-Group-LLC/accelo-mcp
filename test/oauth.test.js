@@ -171,6 +171,14 @@ async function mcpJson(response) {
   return JSON.parse(data.slice(6));
 }
 
+async function waitForOutput(value) {
+  const deadline = Date.now() + 1000;
+  while (!output.includes(value) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(output.includes(value), `server log contains ${value}`);
+}
+
 function seedAccessToken(id) {
   const access = randomUUID();
   db.prepare('INSERT INTO access_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
@@ -206,8 +214,7 @@ test('unknown authorization client is rejected without changing clients or auth 
 for (const [name, metadata] of [
   ['missing redirect URIs', {}],
   ['empty redirect URIs', { redirect_uris: [] }],
-  ['empty redirect URI', { redirect_uris: [''] }],
-  ['invalid redirect scheme', { redirect_uris: ['javascript:alert(1)'] }],
+  ['non-local HTTP redirect URI', { redirect_uris: ['http://evil.example/cb'] }],
 ]) {
   test(`dynamic registration rejects ${name}`, async () => {
     const response = await fetch(`${baseUrl}/register`, {
@@ -248,7 +255,7 @@ test('authorize renders consent without reaching Accelo and defaults the stored 
   assert.equal(response.headers.get('location'), null);
   assert.equal(response.headers.get('content-type'), 'text/html; charset=utf-8');
   assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+  assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'");
   assert.equal(response.headers.get('x-frame-options'), 'DENY');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
@@ -257,10 +264,39 @@ test('authorize renders consent without reaching Accelo and defaults the stored 
   assert.match(html, /https:\/\/client\.example/);
   assert.match(html, /Registered less than a minute ago/);
   assert.ok(!html.includes(clientId), 'opaque client id is not shown to the user');
+  assert.ok(html.indexOf('value="deny"') < html.indexOf('value="approve"'), 'Deny is the first form action');
+  assert.match(html, /class="deny"[^>]*>Deny/);
+  assert.match(html, /\.deny\s*\{[^}]*font-weight:\s*700/s);
+  assert.match(html, /\.approve\s*\{[^}]*text-decoration:\s*underline/s);
   const row = db.prepare('SELECT * FROM consent_requests').get();
   assert.equal(row.code_challenge, challenge);
   assert.equal(row.code_challenge_method, 'S256');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
+});
+
+test('localhost HTTP redirect URI is accepted while a hostile URI path is not rendered', async () => {
+  const localRedirect = 'http://localhost:3080/cb';
+  const registration = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [localRedirect] }),
+  });
+  assert.equal(registration.status, 201);
+  const client = await registration.json();
+  await waitForOutput('[register] client registered for redirect host(s): localhost:3080');
+
+  const hostileRedirect = 'https://client.example/"><script>alert(1)</script>';
+  db.prepare('UPDATE clients SET redirect_uris = ? WHERE client_id = ?')
+    .run(JSON.stringify([hostileRedirect]), client.client_id);
+  const authorization = await authorize({
+    client_id: client.client_id,
+    redirect_uri: hostileRedirect,
+  });
+  assert.equal(authorization.status, 200);
+  const html = await authorization.text();
+  assert.ok(!html.includes('"><script>'), 'hostile path markup is not emitted raw');
+  assert.ok(!html.includes(hostileRedirect), 'the full redirect URI is not rendered');
+  assert.match(html, /https:\/\/client\.example/);
 });
 
 test('consent approval is single-use and only then creates auth state for the Accelo redirect', async () => {
@@ -277,6 +313,7 @@ test('consent approval is single-use and only then creates auth state for the Ac
   assert.equal(row.client_state, 'test-client-state');
   assert.equal(row.code_challenge_method, 'S256');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
+  await waitForOutput('[authorize] consent granted for redirect host: client.example');
   assert.equal((await fetch(`${baseUrl}/authorize/consent`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -293,6 +330,7 @@ test('consent denial redirects with access_denied and never creates auth state',
   assert.equal(destination.origin + destination.pathname, redirectUri);
   assert.equal(destination.searchParams.get('error'), 'access_denied');
   assert.equal(destination.searchParams.get('state'), 'denied-state');
+  await waitForOutput('[authorize] consent denied for redirect host: client.example');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
 });
@@ -469,10 +507,12 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   const defaultResponse = await fetch(`${baseUrl}/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: [redirectUri] }),
+    body: JSON.stringify({ redirect_uris: ['http://localhost:3080/cb'] }),
   });
   assert.equal(defaultResponse.status, 201);
-  assert.equal((await defaultResponse.json()).scope, 'full');
+  const defaultClient = await defaultResponse.json();
+  assert.equal(defaultClient.scope, 'full');
+  assert.deepEqual(defaultClient.redirect_uris, ['http://localhost:3080/cb']);
 
   const invalidResponse = await fetch(`${baseUrl}/register`, {
     method: 'POST',

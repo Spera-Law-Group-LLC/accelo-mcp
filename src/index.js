@@ -25,7 +25,9 @@ const redirectUriOrigin = (value) => {
   if (typeof value !== 'string' || value !== value.trim()) return null;
   try {
     const url = new URL(value);
-    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.hash) return null;
+    if ((url.protocol !== 'https:' &&
+         !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) ||
+        url.username || url.password || url.hash) return null;
     return url.origin;
   } catch {
     return null;
@@ -117,7 +119,7 @@ app.post('/register', registerLimiter, (req, res) => {
   const client_secret = rand(24);
   db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at, scope) VALUES (?,?,?,?,?)')
     .run(client_id, client_secret, JSON.stringify(redirect_uris), now(), scope);
-  const hosts = [...new Set(redirect_uris.map((uri) => new URL(uri).hostname))].join(',');
+  const hosts = [...new Set(redirect_uris.map((uri) => new URL(uri).host))].join(',');
   log('[register] client registered for redirect host(s):', hosts);
   res.status(201).json({
     client_id,
@@ -133,7 +135,16 @@ app.post('/register', registerLimiter, (req, res) => {
 function renderConsentPage(consentId, redirectOrigin, createdAt) {
   return `<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorization request</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorization request</title>
+<style>
+  body { font: 16px system-ui, sans-serif; margin: 0; padding: 2rem; }
+  main { margin: 0 auto; max-width: 36rem; }
+  form { display: flex; flex-direction: column; align-items: flex-start; gap: 1rem; margin-top: 2rem; }
+  button { cursor: pointer; font: inherit; }
+  .deny { background: #24364b; border: 0; border-radius: .3rem; color: white; font-weight: 700; padding: .9rem 1.4rem; }
+  .approve { background: none; border: 0; color: #24364b; padding: .5rem 0; text-decoration: underline; }
+</style>
+</head>
 <body>
   <main>
     <h1>Authorization request</h1>
@@ -143,8 +154,8 @@ function renderConsentPage(consentId, redirectOrigin, createdAt) {
     <p>Continue only if you recognize this application and expected this request.</p>
     <form method="post" action="/authorize/consent">
       <input type="hidden" name="consent_id" value="${escapeHtml(consentId)}">
-      <button type="submit" name="action" value="approve">Continue to Accelo</button>
-      <button type="submit" name="action" value="deny">Deny</button>
+      <button class="deny" type="submit" name="action" value="deny">Deny</button>
+      <button class="approve" type="submit" name="action" value="approve">Continue to Accelo</button>
     </form>
   </main>
 </body>
@@ -154,7 +165,7 @@ function renderConsentPage(consentId, redirectOrigin, createdAt) {
 function setConsentHeaders(res) {
   res.set({
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    'Content-Security-Policy': "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'",
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
@@ -247,7 +258,7 @@ app.post('/authorize/consent', authorizeLimiter, (req, res) => {
   if (action === 'deny') {
     redirect.searchParams.set('error', 'access_denied');
     if (pending.client_state) redirect.searchParams.set('state', pending.client_state);
-    log('[authorize] consent denied');
+    log('[authorize] consent denied for redirect host:', redirect.host);
     return res.redirect(redirect.toString());
   }
 
@@ -258,7 +269,7 @@ app.post('/authorize/consent', authorizeLimiter, (req, res) => {
     ourState, pending.client_id, pending.client_redirect_uri, pending.client_state,
     pending.code_challenge, pending.code_challenge_method || 'S256', now(),
   );
-  log('[authorize] consent granted');
+  log('[authorize] consent granted for redirect host:', redirect.host);
   res.redirect(buildAcceloAuthorizationUrl(ourState));
 });
 
