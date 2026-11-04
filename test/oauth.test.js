@@ -27,6 +27,19 @@ async function listen(server) {
 
 before(async () => {
   directory = await mkdtemp(path.join(tmpdir(), 'accelo-mcp-oauth-'));
+  const tokenDbPath = path.join(directory, 'tokens.db');
+  const legacyDb = new Database(tokenDbPath);
+  legacyDb.exec(`
+    CREATE TABLE clients (
+      client_id TEXT PRIMARY KEY,
+      client_secret TEXT,
+      redirect_uris TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    )
+  `);
+  legacyDb.prepare('INSERT INTO clients VALUES (?,?,?,?)')
+    .run('legacy-client', null, JSON.stringify([redirectUri]), Date.now());
+  legacyDb.close();
   upstream = http.createServer(async (req, res) => {
     let body = '';
     for await (const chunk of req) body += chunk;
@@ -57,7 +70,7 @@ before(async () => {
       ACCELO_CLIENT_ID: 'mock-upstream-client',
       ACCELO_CLIENT_SECRET: randomBytes(24).toString('base64url'),
       ACCELO_OAUTH_URL: `http://127.0.0.1:${upstreamPort}`,
-      TOKEN_DB_PATH: path.join(directory, 'tokens.db'),
+      TOKEN_DB_PATH: tokenDbPath,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -77,7 +90,10 @@ before(async () => {
       }
     });
   });
-  db = new Database(path.join(directory, 'tokens.db'));
+  db = new Database(tokenDbPath);
+  const scopeColumn = db.prepare('PRAGMA table_info(clients)').all().find((column) => column.name === 'scope');
+  assert.ok(scopeColumn, 'opening an existing database adds clients.scope');
+  assert.equal(db.prepare('SELECT scope FROM clients WHERE client_id = ?').get('legacy-client').scope, null);
 });
 
 after(async () => {
@@ -99,6 +115,7 @@ beforeEach(() => {
   insert.run(clientId, clientSecret, JSON.stringify([redirectUri]), Date.now());
   insert.run('other-client', clientSecret, JSON.stringify([redirectUri]), Date.now());
   insert.run('public-client', null, JSON.stringify([redirectUri]), Date.now());
+  insert.run('legacy-client', null, JSON.stringify([redirectUri]), Date.now());
 });
 
 function authorize(overrides = {}) {
@@ -118,6 +135,34 @@ function token(body) {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(body),
   });
+}
+
+function mcpRequest(accessToken, method, params = {}) {
+  return fetch(`${baseUrl}/mcp`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + accessToken,
+      'Content-Type': 'application/json',
+      Accept: 'application/json, text/event-stream',
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method, params }),
+  });
+}
+
+async function mcpJson(response) {
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) return response.json();
+  const text = await response.text();
+  const data = text.split(/\r?\n/).find((line) => line.startsWith('data: '));
+  assert.ok(data, `MCP response has no data event: ${text}`);
+  return JSON.parse(data.slice(6));
+}
+
+function seedAccessToken(id) {
+  const access = randomUUID();
+  db.prepare('INSERT INTO access_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
+    .run(access, 'test-subject', id, Date.now() + 600000);
+  return access;
 }
 
 function seedCode(id = clientId, codeChallenge = challenge) {
@@ -257,6 +302,7 @@ test('registered confidential client completes PKCE authorization, callback, red
   });
   assert.equal(registration.status, 201);
   const client = await registration.json();
+  assert.equal(client.scope, 'full');
   assert.equal(client.token_endpoint_auth_method, 'client_secret_post');
   const authorization = await authorize({ client_id: client.client_id, state: 'test-client-state' });
   assert.equal(authorization.status, 302);
@@ -279,6 +325,10 @@ test('registered confidential client completes PKCE authorization, callback, red
   const access = db.prepare('SELECT * FROM access_tokens WHERE token = ?').get(issued.access_token);
   assert.equal(access.client_id, client.client_id);
   assert.equal(db.prepare('SELECT * FROM accelo_tokens WHERE subject = ?').get(access.subject).access_token, 'mock-upstream-access');
+  const listed = await mcpRequest(issued.access_token, 'tools/list');
+  assert.equal(listed.status, 200);
+  const listedBody = await mcpJson(listed);
+  assert.equal(listedBody.result.tools.length, 31, 'dynamically registered LibreChat clients retain all tools');
   assert.equal((await token(request)).status, 400);
   const refreshRequest = {
     grant_type: 'refresh_token', refresh_token: issued.refresh_token,
@@ -294,4 +344,109 @@ test('registered confidential client completes PKCE authorization, callback, red
   for (const sensitive of [clientSecret, client.client_secret, verifier, request.code, issued.access_token, issued.refresh_token]) {
     assert.ok(!output.includes(sensitive), 'lifecycle logs must not include credentials');
   }
+});
+
+test('dynamic registration accepts supported scopes and defaults absent scope to full', async () => {
+  const readonlyResponse = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri], scope: 'read_only' }),
+  });
+  assert.equal(readonlyResponse.status, 201);
+  const readonlyClient = await readonlyResponse.json();
+  assert.equal(readonlyClient.scope, 'read_only');
+  assert.equal(db.prepare('SELECT scope FROM clients WHERE client_id = ?').get(readonlyClient.client_id).scope, 'read_only');
+
+  const fullResponse = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri], scope: 'full' }),
+  });
+  assert.equal(fullResponse.status, 201);
+  const fullClient = await fullResponse.json();
+  assert.equal(fullClient.scope, 'full');
+  const fullAccess = seedAccessToken(fullClient.client_id);
+  const fullList = await mcpRequest(fullAccess, 'tools/list');
+  assert.equal((await mcpJson(fullList)).result.tools.length, 31);
+
+  const defaultResponse = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri] }),
+  });
+  assert.equal(defaultResponse.status, 201);
+  assert.equal((await defaultResponse.json()).scope, 'full');
+
+  const invalidResponse = await fetch(`${baseUrl}/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: [redirectUri], scope: 'write_all' }),
+  });
+  assert.equal(invalidResponse.status, 400);
+  assert.deepEqual(await invalidResponse.json(), { error: 'invalid_client_metadata' });
+});
+
+test('read-only clients see only the 17 allowlisted tools and cannot call a write tool', async () => {
+  db.prepare('UPDATE clients SET scope = ? WHERE client_id = ?').run('read_only', clientId);
+  const access = seedAccessToken(clientId);
+  const listed = await mcpRequest(access, 'tools/list');
+  assert.equal(listed.status, 200);
+  const names = (await mcpJson(listed)).result.tools.map((tool) => tool.name);
+  assert.equal(names.length, 17);
+  for (const name of [
+    'list_activities', 'get_activity', 'get_activity_recipients', 'get_activity_thread',
+    'get_issue', 'list_issues', 'get_issue_profile_values', 'list_issue_activities',
+    'list_quotes', 'get_quote', 'get_deal', 'get_project_plan', 'list_tasks',
+    'get_task', 'list_task_progressions', 'get_project_profile_values', 'list_project_activities',
+  ]) {
+    assert.ok(names.includes(name), `${name} is registered for read-only clients`);
+  }
+  for (const name of [
+    'create_activity', 'log_note', 'log_email', 'reply_to_activity', 'log_time',
+    'create_quote', 'update_quote', 'trigger_quote_template', 'update_task',
+    'create_task', 'update_milestone', 'reschedule_plan', 'progress_task', 'cancel_task',
+  ]) {
+    assert.ok(!names.includes(name), `${name} is withheld from read-only clients`);
+  }
+
+  const called = await mcpRequest(access, 'tools/call', {
+    name: 'log_note',
+    arguments: { against_type: 'job', against_id: '1', subject: 'test', body: 'test', confirm: true },
+  });
+  assert.equal(called.status, 200);
+  const result = await mcpJson(called);
+  assert.match(JSON.stringify(result), /not found/i);
+  assert.ok(!JSON.stringify(result).includes('confirmation_required'));
+});
+
+test('legacy NULL-scope and dangling-client tokens resolve to the intended capabilities', async () => {
+  const legacyAccess = seedAccessToken('legacy-client');
+  const legacyList = await mcpRequest(legacyAccess, 'tools/list');
+  assert.equal((await mcpJson(legacyList)).result.tools.length, 31);
+
+  const orphanAccess = seedAccessToken('deleted-client');
+  const orphanList = await mcpRequest(orphanAccess, 'tools/list');
+  assert.equal((await mcpJson(orphanList)).result.tools.length, 17);
+});
+
+test('full-scope write tools preserve the confirm:true preview response', async () => {
+  const access = seedAccessToken(clientId);
+  const called = await mcpRequest(access, 'tools/call', {
+    name: 'log_note',
+    arguments: { against_type: 'job', against_id: '1', subject: 'test', body: 'test' },
+  });
+  const result = await mcpJson(called);
+  assert.equal(result.result.content[0].text, JSON.stringify({
+    status: 'confirmation_required',
+    message: 'This will LOG a note in Accelo. Review the details below with the user, then call this tool again with confirm: true to proceed.',
+    pending: {
+      against: 'job(1)',
+      medium: 'note',
+      subject: 'test',
+      body: 'test',
+      visibility: 'all',
+      class: '13',
+      reply_to_parent_id: null,
+    },
+  }, null, 2));
 });

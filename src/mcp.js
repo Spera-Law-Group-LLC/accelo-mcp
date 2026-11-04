@@ -63,13 +63,45 @@ function pickEditableFields(args) {
   return body;
 }
 
+const READ_TOOLS = new Set([
+  'list_activities',
+  'get_activity',
+  'get_activity_recipients',
+  'get_activity_thread',
+  'get_issue',
+  'list_issues',
+  'get_issue_profile_values',
+  'list_issue_activities',
+  'list_quotes',
+  'get_quote',
+  'get_deal',
+  'get_project_plan',
+  'list_tasks',
+  'get_task',
+  'list_task_progressions',
+  'get_project_profile_values',
+  'list_project_activities',
+]);
+
+export function scopedServer(server, scope) {
+  if (scope !== 'read_only') return server;
+  return new Proxy(server, {
+    get(target, prop, receiver) {
+      if (prop !== 'tool') return Reflect.get(target, prop, receiver);
+      return (name, ...rest) =>
+        READ_TOOLS.has(name) ? target.tool(name, ...rest) : undefined;
+    },
+  });
+}
+
 // Build a fresh MCP server bound to a specific authenticated subject
 // (i.e. one Accelo user). All Accelo calls run as that user, so Accelo's
 // own permission model is respected.
-export function buildServer(subject) {
+export function buildServer(subject, scope = 'full') {
   const server = new McpServer({ name: 'accelo-mcp', version: '0.5.0' });
+  const tools = scopedServer(server, scope);
 
-  server.tool(
+  tools.tool(
     'list_quotes',
     'List or search quotes in Accelo. Returns only quotes the authorized user can see.',
     {
@@ -84,7 +116,7 @@ export function buildServer(subject) {
     }
   );
 
-  server.tool(
+  tools.tool(
     'get_quote',
     'Get a single Accelo quote by its ID.',
     { id: z.string().describe('The quote ID') },
@@ -94,7 +126,7 @@ export function buildServer(subject) {
     }
   );
 
-  server.tool(
+  tools.tool(
     'get_deal',
     'Get a single Accelo deal (a.k.a. sale/prospect) by its ID. Use this to resolve the parent deal of a quote: when a quote has against_type == "prospect", its against_id is the deal ID. Returns the full deal record including title, value, standing, and dates such as date_actioned (when the deal was actioned/won).',
     { id: z.string().describe("The deal/prospect ID, e.g. a quote's against_id") },
@@ -104,7 +136,7 @@ export function buildServer(subject) {
     }
   );
 
-  server.tool(
+  tools.tool(
     'create_quote',
     'Create a new Accelo quote. WRITE OPERATION: requires confirm:true. Call once without confirm to preview the payload, show it to the user for approval, then call again with confirm:true. Each editable field maps 1:1 to an Accelo quote key; pick the field that matches the user intent (e.g. a client-facing closing goes in `conclusion`, NOT `notes`).',
     {
@@ -129,7 +161,7 @@ export function buildServer(subject) {
     }
   );
 
-  server.tool(
+  tools.tool(
     'update_quote',
     'Update an existing Accelo quote by ID. WRITE OPERATION: requires confirm:true. Call once without confirm to preview the change, show it to the user for approval, then call again with confirm:true. Only the provided fields are changed. Each editable field maps 1:1 to an Accelo quote key; pick the field that matches the user intent (e.g. a client-facing closing goes in `conclusion`, NOT `notes`).',
     {
@@ -160,7 +192,7 @@ export function buildServer(subject) {
   //   - AUTOMATION_KEY lives only in server env (config.automationKey) — never in prompts
   //   - quote_id is validated as numeric before any I/O
   // ---------------------------------------------------------------------------
-  server.tool(
+  tools.tool(
     'trigger_quote_template',
     'Apply the "Value Price - Three Options + Final Agreement" proposal template to a quote, ' +
     'then seed the Estimate with the @Value Price Proposal project template. ' +
@@ -217,13 +249,13 @@ export function buildServer(subject) {
   );
 
   // Project-planning tools (read + task/milestone writes) + profile values + scoped activities.
-  registerProjectTools(server, subject);
+  registerProjectTools(tools, subject);
 
   // Activity tools (notes/emails/time, threading, provenance).
-  registerActivityTools(server, subject);
+  registerActivityTools(tools, subject);
 
   // Issue tools (issue records, profile values + scoped activities).
-  registerIssueTools(server, subject);
+  registerIssueTools(tools, subject);
 
   return server;
 }
