@@ -174,12 +174,37 @@ async function mcpJson(response) {
   return JSON.parse(data.slice(6));
 }
 
-async function waitForOutput(value) {
+async function waitForOutput(value, start = 0) {
   const deadline = Date.now() + 1000;
-  while (!output.includes(value) && Date.now() < deadline) {
+  while (!output.slice(start).includes(value) && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.ok(output.includes(value), `server log contains ${value}`);
+  assert.ok(output.slice(start).includes(value), `server log contains ${value}`);
+}
+
+let registrationNumber = 0;
+async function register(metadata, headers = {}) {
+  const ip = `198.51.100.${++registrationNumber}`;
+  const start = output.length;
+  const response = await new Promise((resolve, reject) => {
+    const request = http.request(`${baseUrl}/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': `203.0.113.99, ${ip}`,
+        ...headers,
+      },
+    }, (res) => {
+      let body = '';
+      res.on('data', (data) => { body += data; });
+      res.on('end', () => resolve({ status: res.statusCode, body: JSON.parse(body) }));
+      res.on('error', reject);
+    });
+    request.on('error', reject);
+    request.end(JSON.stringify(metadata));
+  });
+  await waitForOutput('\n', start);
+  return { ...response, ip, log: output.slice(start) };
 }
 
 function seedAccessToken(id) {
@@ -215,6 +240,12 @@ function runNode(args, tokenDbPath = path.join(directory, 'tokens.db')) {
       TOKEN_DB_PATH: tokenDbPath,
     },
   });
+}
+
+function assertNoSentinels(text, values) {
+  for (const value of values) {
+    assert.ok(!text.includes(value), `output does not include ${value}`);
+  }
 }
 
 function lastUsed(id = clientId) {
@@ -364,13 +395,11 @@ test('registry report is read-only, classifies clients, counts tokens, and redac
   assert.match(human.stdout, /Total: 4 \| LIVE: 3 \| STALE: 0 \| INERT: 1 \| Never observed: 1/);
   for (const result of [json, human]) {
     assert.equal(result.stderr, '');
-    for (const value of [
+    assertNoSentinels(result.stdout, [
       secret, access, refresh, 'sentinel-expired-access', 'sentinel-expiring-refresh', 'sentinel-expired-refresh',
       clientId, 'other-client', 'public-client', 'legacy-client', privateRedirect, redirectUri,
       'private-callback', 'private-query', 'subject-one', 'subject-two', 'subject-three', 'client_secret',
-    ]) {
-      assert.ok(!result.stdout.includes(value), `report does not include ${value}`);
-    }
+    ]);
   }
   assert.deepEqual(snapshot(), before);
 });
@@ -399,6 +428,119 @@ test('unknown authorization client is rejected without changing clients or auth 
   assert.deepEqual(db.prepare('SELECT * FROM clients ORDER BY client_id').all(), clients);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM consent_requests').get().count, 0);
+});
+
+test('successful registration logs the observed source, client prefix, scope, and redirect origins', async () => {
+  const result = await register({
+    redirect_uris: [redirectUri, 'http://localhost:3080/callback'],
+    scope: 'read_only',
+  }, { 'User-Agent': 'registration-test' });
+  assert.equal(result.status, 201);
+  assert.match(result.log, /\[register\] level=info client registered/);
+  assert.ok(result.log.includes(`ip="${result.ip}"`));
+  assert.ok(!result.log.includes('203.0.113.99'), 'untrusted leftmost forwarded IP is not logged');
+  assert.ok(result.log.includes(`client_id=${result.body.client_id.slice(0, 8)} scope=read_only`));
+  assert.match(result.log, /user_agent="registration-test"/);
+  assert.match(result.log, /redirect_origins=https:\/\/client\.example,http:\/\/localhost:3080/);
+  assert.ok(!result.log.includes(result.body.client_id), 'only the client id prefix is logged');
+  assert.equal(result.log.split('\n').length, 2);
+});
+
+test('rejected registration logs origin fields and each validation reason', async () => {
+  for (const [metadata, reason, origins] of [
+    [{ scope: 'unsupported', redirect_uris: [redirectUri] }, 'invalid_client_metadata', 'https://client.example'],
+    [{ redirect_uris: [redirectUri, 'http://evil.example/private'] }, 'invalid_redirect_uri', 'https://client.example,(invalid)'],
+    [{}, 'invalid_redirect_uri', '(none)'],
+    [{ redirect_uris: [null, 42, {}] }, 'invalid_redirect_uri', '(invalid)'],
+  ]) {
+    const result = await register(metadata, { 'User-Agent': 'rejected-test' });
+    assert.equal(result.status, 400);
+    assert.deepEqual(result.body, { error: reason });
+    assert.ok(result.log.includes(`[register] level=warn rejected reason=${reason}`));
+    assert.ok(result.log.includes(`ip="${result.ip}" user_agent="rejected-test"`));
+    assert.ok(result.log.includes(`redirect_origins=${origins}`));
+    assert.equal(result.log.split('\n').length, 2);
+  }
+});
+
+test('registration strips all C0/C1 controls and neutralizes forged log markers in real emitted output', async () => {
+  // HTTP rejects CR/LF headers, so invoke the real handler before the HTTP parser.
+  const controls = Array.from({ length: 65 }, (_, i) => String.fromCharCode(i < 32 ? i : i + 95)).join('');
+  const userAgent = `agent\r\n[register] forged line${controls}`;
+  const ip = '198.51.100.200\r\n[register] forged ip';
+  const result = await runNode(['--input-type=module', '--eval', `
+    import assert from 'node:assert/strict';
+    import express from ${JSON.stringify(new URL('../node_modules/express/index.js', import.meta.url).href)};
+    const post = express.application.post;
+    let register;
+    express.application.post = function(route, ...handlers) {
+      if (route === '/register') register = handlers.at(-1);
+      return post.call(this, route, ...handlers);
+    };
+    express.application.listen = () => {};
+    await import(${JSON.stringify(new URL('../src/index.js', import.meta.url).href)});
+    const { default: db } = await import(${JSON.stringify(new URL('../src/db.js', import.meta.url).href)});
+    try {
+      register({
+        body: {}, ip: ${JSON.stringify(ip)},
+        get: () => ${JSON.stringify(userAgent)},
+      }, {
+        status(code) { assert.equal(code, 400); return this; },
+        json(body) { assert.deepEqual(body, { error: 'invalid_redirect_uri' }); },
+      });
+    } finally { db.close(); }
+  `]);
+  assert.equal(result.stderr, '');
+  assert.equal(result.stdout.split('\n').length, 2, 'exactly one real log line is emitted');
+  assert.equal(result.stdout.match(/\[register\]/g).length, 1, 'no injected register marker survives');
+  assert.doesNotMatch(result.stdout.slice(0, -1), /[\u0000-\u001f\u007f-\u009f]/);
+  assert.ok(result.stdout.includes('user_agent="agent\\u005bregister] forged line"'));
+  assert.ok(result.stdout.includes('ip="198.51.100.200\\u005bregister] forged ip"'));
+});
+
+test('registration truncates User-Agent to 120 characters after stripping controls in both branches', async () => {
+  for (const scope of ['full', 'unsupported']) {
+    const result = await register({ redirect_uris: [redirectUri], scope }, {
+      'User-Agent': `${'a'.repeat(119)}\tb-tail-must-not-be-logged`,
+    });
+    assert.equal(result.status, scope === 'full' ? 201 : 400);
+    const field = result.log.match(/user_agent=("(?:[^"\\]|\\.)*")/)[1];
+    assert.equal(JSON.parse(field), `${'a'.repeat(119)}b`);
+    assert.ok(!result.log.includes('tail-must-not-be-logged'));
+    assert.doesNotMatch(result.log, /[\t\u0080\u009f]/);
+  }
+});
+
+test('registration logs a literal dash for missing User-Agent in both branches', async () => {
+  for (const metadata of [{ redirect_uris: [redirectUri] }, {}]) {
+    const result = await register(metadata);
+    assert.equal(result.status, metadata.redirect_uris ? 201 : 400);
+    assert.match(result.log, /user_agent="-"/);
+  }
+});
+
+test('registration success and rejection logs pass the registry-report secret sentinel sweep', async () => {
+  const privateRedirect = 'https://client.example/private-callback?sentinel=private-query';
+  const hostileRedirect = 'https://evil.example/private-callback?sentinel=private-query#fragment';
+  const sentinels = [
+    'sentinel-secret-not-a-real-credential', 'sentinel-access-not-a-real-token',
+    'sentinel-refresh-not-a-real-token', privateRedirect, hostileRedirect, redirectUri,
+    'private-callback', 'private-query', '#fragment',
+    'client_secret', 'access_token', 'refresh_token',
+  ];
+  for (const metadata of [
+    { redirect_uris: [privateRedirect] },
+    { redirect_uris: [privateRedirect], scope: 'unsupported' },
+    { redirect_uris: [privateRedirect, hostileRedirect] },
+  ]) {
+    const result = await register({
+      ...metadata,
+      client_secret: sentinels[0], access_token: sentinels[1], refresh_token: sentinels[2],
+    });
+    assert.equal(result.status, metadata.scope || metadata.redirect_uris.includes(hostileRedirect) ? 400 : 201);
+    assertNoSentinels(result.log, [...sentinels, clientSecret, ...(result.body.client_secret ? [result.body.client_secret] : [])]);
+    assert.match(result.log, /redirect_origins=https:\/\/client\.example/);
+  }
 });
 
 for (const [name, metadata] of [
@@ -473,7 +615,7 @@ test('localhost HTTP redirect URI is accepted while a hostile URI path is not re
   });
   assert.equal(registration.status, 201);
   const client = await registration.json();
-  await waitForOutput('[register] client registered for redirect host(s): localhost:3080');
+  await waitForOutput('redirect_origins=http://localhost:3080');
 
   const hostileRedirect = 'https://client.example/"><script>alert(1)</script>';
   db.prepare('UPDATE clients SET redirect_uris = ? WHERE client_id = ?')
