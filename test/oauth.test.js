@@ -391,6 +391,165 @@ test('registry report rejects invalid options without echoing their values', asy
   }
 });
 
+function registrySnapshot() {
+  return {
+    clients: db.prepare('SELECT * FROM clients ORDER BY client_id').all(),
+    access: db.prepare('SELECT * FROM access_tokens ORDER BY token').all(),
+    refresh: db.prepare('SELECT * FROM refresh_tokens ORDER BY token').all(),
+  };
+}
+
+function seedPruneRegistry() {
+  const now = Date.now();
+  const old = now - 100 * 86400000;
+  const privateRedirect = 'https://client.example/private-prune-callback?sentinel=private-prune-query';
+  db.prepare('UPDATE clients SET created_at = ?, redirect_uris = ?')
+    .run(old, JSON.stringify([privateRedirect]));
+  db.prepare('UPDATE clients SET redirect_uris = ? WHERE client_id = ?').run('[]', 'public-client');
+  const insert = db.prepare(`
+    INSERT INTO clients (client_id, redirect_uris, created_at, last_used_at) VALUES (?,?,?,?)
+  `);
+  insert.run('expired-access-client', JSON.stringify([privateRedirect]), old, null);
+  insert.run('expired-refresh-client', JSON.stringify([privateRedirect]), old, null);
+  insert.run('observed-client', JSON.stringify([privateRedirect]), old, old);
+  insert.run('recent-client', JSON.stringify([privateRedirect]), now - 60000, null);
+  seedAccessToken('other-client');
+  const expiredAccess = seedAccessToken('expired-access-client');
+  db.prepare('UPDATE access_tokens SET expires_at = ? WHERE token = ?').run(now - 1000, expiredAccess);
+  seedRefresh('legacy-client', null);
+  seedRefresh('expired-refresh-client', now - 1000);
+  return registrySnapshot();
+}
+
+function assertPruneRedacted(stdout, snapshot) {
+  for (const value of [
+    ...snapshot.clients.map((row) => row.client_id),
+    clientSecret, ...snapshot.access.map((row) => row.token),
+    ...snapshot.refresh.map((row) => row.token),
+    'test-subject', 'private-prune-callback', 'private-prune-query', 'client_secret',
+  ]) {
+    assert.ok(!stdout.includes(value), `prune output does not include ${value}`);
+  }
+}
+
+test('registry prune dry run lists only eligible rows and leaves all three tables unchanged', async () => {
+  const before = seedPruneRegistry();
+  const script = path.join(root, 'scripts/registry-report.mjs');
+  const human = await runNode([script, '--prune']);
+  assert.match(human.stdout, /test-cli/);
+  assert.match(human.stdout, /public-c/);
+  assert.match(human.stdout, /https:\/\/client.example/);
+  assert.match(human.stdout, /Total: 2 \| LIVE: 0 \| STALE: 1 \| INERT: 1/);
+  assert.match(human.stdout, /Would delete 2 client rows\. Dry run; no changes made\./);
+  assert.equal(human.stderr, '');
+  assertPruneRedacted(human.stdout, before);
+  assert.deepEqual(registrySnapshot(), before);
+  for (const days of ['1', '365']) {
+    const json = await runNode([script, '--prune', '--json', '--stale-days', days]);
+    const preview = JSON.parse(json.stdout);
+    const normal = JSON.parse((await runNode([script, '--json', '--stale-days', days])).stdout);
+    assert.deepEqual(preview.clients,
+      normal.clients.filter((row) => ['test-cli', 'public-c'].includes(row.client_id)));
+    assert.equal(preview.would_delete, 2);
+    assertPruneRedacted(json.stdout, before);
+    assert.deepEqual(registrySnapshot(), before);
+  }
+});
+
+test('registry prune confirm deletes exactly eligible clients and prints the resulting summary', async () => {
+  const before = seedPruneRegistry();
+  const result = await runNode([path.join(root, 'scripts/registry-report.mjs'), '--prune', '--confirm']);
+  assert.deepEqual(registrySnapshot(), {
+    ...before, clients: before.clients.filter((row) => ![clientId, 'public-client'].includes(row.client_id)),
+  });
+  assert.match(result.stdout, /Deleted 2 client rows\./);
+  const summary = JSON.parse((await runNode([path.join(root, 'scripts/registry-report.mjs'), '--json'])).stdout).summary;
+  assert.ok(result.stdout.trimEnd().endsWith(
+    `Total: ${summary.total} | LIVE: ${summary.LIVE} | STALE: ${summary.STALE} | INERT: ${summary.INERT} | Never observed: ${summary.never_observed}`));
+  assert.equal(summary.total, 6);
+  assert.equal(result.stderr, '');
+  assertPruneRedacted(result.stdout, before);
+});
+
+test('registry prune preserves a client holding only an expired access token', async () => {
+  const before = seedPruneRegistry();
+  await runNode([path.join(root, 'scripts/registry-report.mjs'), '--prune', '--confirm']);
+  assert.deepEqual(db.prepare('SELECT * FROM clients WHERE client_id = ?').get('expired-access-client'),
+    before.clients.find((row) => row.client_id === 'expired-access-client'));
+  assert.deepEqual(registrySnapshot().access, before.access);
+});
+
+test('registry prune preserves clients holding only refresh tokens, including expired tokens', async () => {
+  const before = seedPruneRegistry();
+  await runNode([path.join(root, 'scripts/registry-report.mjs'), '--prune', '--confirm']);
+  for (const id of ['legacy-client', 'expired-refresh-client']) {
+    assert.deepEqual(db.prepare('SELECT * FROM clients WHERE client_id = ?').get(id),
+      before.clients.find((row) => row.client_id === id));
+  }
+  assert.deepEqual(registrySnapshot().refresh, before.refresh);
+});
+
+test('registry prune preserves an observed client with no tokens even when its activity is old', async () => {
+  const before = seedPruneRegistry();
+  await runNode([path.join(root, 'scripts/registry-report.mjs'), '--prune', '--confirm']);
+  assert.deepEqual(db.prepare('SELECT * FROM clients WHERE client_id = ?').get('observed-client'),
+    before.clients.find((row) => row.client_id === 'observed-client'));
+});
+
+test('registry prune preserves a token-free client registered one minute ago', async () => {
+  const before = seedPruneRegistry();
+  await runNode([path.join(root, 'scripts/registry-report.mjs'), '--prune', '--confirm']);
+  assert.deepEqual(db.prepare('SELECT * FROM clients WHERE client_id = ?').get('recent-client'),
+    before.clients.find((row) => row.client_id === 'recent-client'));
+});
+
+test('registry confirm without prune fails without changing any registry tables', async () => {
+  const before = seedPruneRegistry();
+  await assert.rejects(runNode([path.join(root, 'scripts/registry-report.mjs'), '--confirm']), (error) => {
+    assert.equal(error.code, 1);
+    assert.equal(error.stdout, '');
+    assert.match(error.stderr, /^Usage:/);
+    return true;
+  });
+  assert.deepEqual(registrySnapshot(), before);
+});
+
+test('registry prune never changes access or refresh token counts or contents', async () => {
+  const before = seedPruneRegistry();
+  const script = path.join(root, 'scripts/registry-report.mjs');
+  for (const flags of [['--prune'], ['--prune', '--confirm'], ['--prune', '--confirm']]) {
+    const result = await runNode([script, ...flags, '--json']);
+    const report = JSON.parse(result.stdout);
+    if (flags.includes('--confirm')) assert.equal(report.remaining_summary.total, 6);
+    assertPruneRedacted(result.stdout, before);
+    const after = registrySnapshot();
+    assert.equal(after.access.length, before.access.length);
+    assert.equal(after.refresh.length, before.refresh.length);
+    assert.deepEqual(after.access, before.access);
+    assert.deepEqual(after.refresh, before.refresh);
+  }
+});
+
+test('registry prune rolls back the entire deletion set if any deletion fails', async () => {
+  const before = seedPruneRegistry();
+  db.exec(`
+    CREATE TRIGGER reject_prune BEFORE DELETE ON clients WHEN OLD.client_id = 'public-client'
+    BEGIN SELECT RAISE(ABORT, 'sentinel-prune-failure'); END;
+  `);
+  try {
+    await assert.rejects(runNode([path.join(root, 'scripts/registry-report.mjs'), '--prune', '--confirm']), (error) => {
+      assert.equal(error.code, 1);
+      assert.equal(error.stdout, '');
+      assert.match(error.stderr, /^Unable to prune the registry\./);
+      assert.ok(!error.stderr.includes('sentinel-prune-failure'));
+      return true;
+    });
+    assert.deepEqual(registrySnapshot(), before);
+  } finally {
+    db.exec('DROP TRIGGER reject_prune');
+  }
+});
+
 test('unknown authorization client is rejected without changing clients or auth state', async () => {
   const clients = db.prepare('SELECT * FROM clients ORDER BY client_id').all();
   const response = await authorize({ client_id: 'unknown-client' });
