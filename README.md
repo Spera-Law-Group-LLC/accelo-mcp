@@ -100,6 +100,27 @@ npm start
 > pre/post-build symbol assertions. Container `Up` + `/healthz` ok do **not**
 > prove the new code is actually in the image (see #29).
 
+## OAuth registry report
+
+```bash
+docker compose exec accelo-mcp node scripts/registry-report.mjs [--json] [--stale-days N]
+```
+
+The read-only report lists truncated client IDs, redirect origins, scope, creation
+and last-use times, live token counts, and distinct subject counts, followed by
+summary counts. It never outputs secrets, token values, or full redirect URIs.
+`--json` produces structured output; `--stale-days` defaults to 90.
+
+- **INERT**: empty registered redirect list (takes precedence over other flags).
+- **STALE**: no live refresh token and last use is unobserved or older than the threshold.
+- **LIVE**: otherwise, including clients holding a live refresh token.
+
+`never observed` means no use recorded since activity tracking was introduced;
+existing clients are not backfilled. Successful token issuance/rotation and
+authenticated MCP requests record activity, at most once per client per minute.
+The report does not delete clients or revoke tokens. Run inside the container or
+as `deploy`: the database is mode `0600`; do not widen its permissions.
+
 ## Endpoints
 
 | Path | Purpose |

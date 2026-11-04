@@ -86,4 +86,13 @@ if (!clientsHasScope()) {
   db.exec('ALTER TABLE clients ADD COLUMN scope TEXT');
 }
 
+function clientsHasLastUsedAt() {
+  const cols = db.prepare('PRAGMA table_info(clients)').all();
+  return cols.some((c) => c.name === 'last_used_at');
+}
+
+if (!clientsHasLastUsedAt()) {
+  db.exec('ALTER TABLE clients ADD COLUMN last_used_at INTEGER');
+}
+
 export default db;

@@ -6,6 +6,7 @@ import { config } from './config.js';
 import db from './db.js';
 import { buildServer } from './mcp.js';
 import { exchangeAcceloCode } from './oauth.js';
+import { redirectUriOrigin } from './redirect-uri.js';
 
 const app = express();
 // Exactly ONE proxy hop (nginx) sits in front of this service. With trust
@@ -21,18 +22,6 @@ app.use(express.urlencoded({ extended: true }));
 const now = () => Date.now();
 const rand = (n = 32) => crypto.randomBytes(n).toString('base64url');
 const log = (...a) => console.log(new Date().toISOString(), ...a);
-const redirectUriOrigin = (value) => {
-  if (typeof value !== 'string' || value !== value.trim()) return null;
-  try {
-    const url = new URL(value);
-    if ((url.protocol !== 'https:' &&
-         !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) ||
-        url.username || url.password || url.hash) return null;
-    return url.origin;
-  } catch {
-    return null;
-  }
-};
 const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (char) => ({
   '&': '&amp;',
   '<': '&lt;',
@@ -339,6 +328,14 @@ function validTokenClient(client_id, client_secret, expectedClientId) {
   return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
 }
 
+const touchClientStatement = db.prepare(
+  'UPDATE clients SET last_used_at = ? WHERE client_id = ? AND (last_used_at IS NULL OR last_used_at < ?)'
+);
+function touchClient(clientId) {
+  const t = now();
+  touchClientStatement.run(t, clientId, t - 60000);
+}
+
 app.post('/token', tokenLimiter, (req, res) => {
   const { grant_type, code, code_verifier, refresh_token, client_id, client_secret } = req.body;
 
@@ -362,6 +359,7 @@ app.post('/token', tokenLimiter, (req, res) => {
       .run(accessToken, ac.subject, ac.client_id, now() + ACCESS_TTL_MS);
     db.prepare('INSERT INTO refresh_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
       .run(refreshToken, ac.subject, ac.client_id, now() + REFRESH_TTL_MS);
+    touchClient(ac.client_id);
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: refreshToken });
   }
 
@@ -386,6 +384,7 @@ app.post('/token', tokenLimiter, (req, res) => {
       .run(accessToken, rt.subject, rt.client_id, now() + ACCESS_TTL_MS);
     db.prepare('INSERT INTO refresh_tokens (token, subject, client_id, expires_at) VALUES (?,?,?,?)')
       .run(newRefresh, rt.subject, rt.client_id, now() + REFRESH_TTL_MS);
+    touchClient(rt.client_id);
     return res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 3600, refresh_token: newRefresh });
   }
 
@@ -398,7 +397,7 @@ function authenticate(req) {
   const m = auth.match(/^Bearer (.+)$/);
   if (!m) return null;
   const row = db.prepare(`
-    SELECT access_tokens.subject, access_tokens.expires_at,
+    SELECT access_tokens.subject, access_tokens.expires_at, access_tokens.client_id,
       CASE
         WHEN clients.client_id IS NULL THEN 'read_only'
         WHEN clients.scope = 'read_only' THEN 'read_only'
@@ -409,7 +408,7 @@ function authenticate(req) {
     WHERE access_tokens.token = ?
   `).get(m[1]);
   if (!row || row.expires_at < now()) return null;
-  return { subject: row.subject, scope: row.scope };
+  return { subject: row.subject, scope: row.scope, client_id: row.client_id };
 }
 
 // ---- MCP endpoint (stateless: one server/transport per request) ----
@@ -422,6 +421,7 @@ app.post('/mcp', async (req, res) => {
     );
     return res.status(401).json({ error: 'invalid_token' });
   }
+  touchClient(client.client_id);
   const server = buildServer(client.subject, client.scope);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on('close', () => { transport.close(); server.close(); });

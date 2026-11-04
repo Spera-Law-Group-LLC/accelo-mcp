@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -7,6 +7,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 import { after, before, beforeEach, test } from 'node:test';
 import Database from 'better-sqlite3';
 
@@ -16,6 +17,7 @@ const clientSecret = randomBytes(24).toString('base64url');
 const verifier = randomBytes(32).toString('base64url');
 const challenge = createHash('sha256').update(verifier).digest('base64url');
 const redirectUri = 'https://client.example/callback';
+const execFileAsync = promisify(execFile);
 let directory, db, child, upstream, baseUrl;
 let output = '';
 
@@ -94,6 +96,7 @@ before(async () => {
   const scopeColumn = db.prepare('PRAGMA table_info(clients)').all().find((column) => column.name === 'scope');
   assert.ok(scopeColumn, 'opening an existing database adds clients.scope');
   assert.equal(db.prepare('SELECT scope FROM clients WHERE client_id = ?').get('legacy-client').scope, null);
+  assert.equal(db.prepare('SELECT last_used_at FROM clients WHERE client_id = ?').get('legacy-client').last_used_at, null);
 });
 
 after(async () => {
@@ -201,6 +204,193 @@ function seedRefresh(id = clientId, expiresAt = Date.now() + 600000) {
   return refresh;
 }
 
+function runNode(args, tokenDbPath = path.join(directory, 'tokens.db')) {
+  return execFileAsync(process.execPath, args, {
+    cwd: directory,
+    env: {
+      ...process.env,
+      PUBLIC_BASE_URL: baseUrl,
+      ACCELO_CLIENT_ID: 'mock-upstream-client',
+      ACCELO_CLIENT_SECRET: clientSecret,
+      TOKEN_DB_PATH: tokenDbPath,
+    },
+  });
+}
+
+function lastUsed(id = clientId) {
+  return db.prepare('SELECT last_used_at FROM clients WHERE client_id = ?').get(id).last_used_at;
+}
+
+test('last-use migration is idempotent and preserves pre-existing clients without backfill', async () => {
+  const filename = path.join(directory, 'migration.db');
+  const legacy = new Database(filename);
+  const original = {
+    client_id: 'pre-existing-client',
+    client_secret: null,
+    redirect_uris: JSON.stringify([redirectUri]),
+    created_at: Date.now() - 86400000,
+  };
+  legacy.exec(`CREATE TABLE clients (
+    client_id TEXT PRIMARY KEY, client_secret TEXT, redirect_uris TEXT NOT NULL, created_at INTEGER NOT NULL
+  )`);
+  legacy.prepare('INSERT INTO clients VALUES (@client_id, @client_secret, @redirect_uris, @created_at)').run(original);
+  legacy.close();
+  const moduleUrl = new URL('../src/db.js', import.meta.url).href;
+  for (let i = 0; i < 2; i++) {
+    await runNode(['--input-type=module', '--eval', `import db from ${JSON.stringify(moduleUrl)}; db.close();`], filename);
+    const migrated = new Database(filename, { readonly: true });
+    try {
+      assert.equal(migrated.prepare('PRAGMA table_info(clients)').all()
+        .filter((column) => column.name === 'last_used_at').length, 1);
+      assert.deepEqual(migrated.prepare('SELECT * FROM clients').get(), {
+        ...original, scope: null, last_used_at: null,
+      });
+    } finally {
+      migrated.close();
+    }
+  }
+});
+
+test('successful authorization-code issuance sets last use and refresh rotation advances it', async () => {
+  const started = Date.now();
+  const response = await token({
+    grant_type: 'authorization_code', code: seedCode(), code_verifier: verifier,
+    client_id: clientId, client_secret: clientSecret,
+  });
+  assert.equal(response.status, 200);
+  const issued = await response.json();
+  assert.ok(lastUsed() >= started && lastUsed() <= Date.now());
+  assert.equal(lastUsed('other-client'), null);
+  const old = Date.now() - 120000;
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(old, clientId);
+  const refreshed = await token({
+    grant_type: 'refresh_token', refresh_token: issued.refresh_token,
+    client_id: clientId, client_secret: clientSecret,
+  });
+  assert.equal(refreshed.status, 200);
+  assert.ok(lastUsed() > old);
+  assert.equal(db.prepare('SELECT token FROM refresh_tokens WHERE token = ?').get(issued.refresh_token), undefined);
+});
+
+test('authenticated MCP requests advance last use with only one write inside a minute', async () => {
+  const access = seedAccessToken(clientId);
+  const old = Date.now() - 120000;
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(old, clientId);
+  db.exec(`
+    CREATE TABLE activity_writes (written_at INTEGER);
+    CREATE TRIGGER count_activity_writes AFTER UPDATE OF last_used_at ON clients
+    BEGIN INSERT INTO activity_writes VALUES (NEW.last_used_at); END;
+  `);
+  try {
+    assert.equal((await mcpRequest(access, 'tools/list')).status, 200);
+    const observed = lastUsed();
+    assert.ok(observed > old);
+    assert.equal((await mcpRequest(access, 'tools/list')).status, 200);
+    assert.equal(lastUsed(), observed);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM activity_writes').get().count, 1);
+    assert.equal(lastUsed('other-client'), null);
+  } finally {
+    db.exec('DROP TRIGGER count_activity_writes; DROP TABLE activity_writes;');
+  }
+});
+
+test('failed MCP authentication does not record client activity', async () => {
+  const access = seedAccessToken(clientId);
+  db.prepare('UPDATE access_tokens SET expires_at = ? WHERE token = ?').run(Date.now() - 1000, access);
+  for (const value of ['unknown-token', access]) {
+    assert.equal((await mcpRequest(value, 'tools/list')).status, 401);
+    assert.equal(lastUsed(), null);
+  }
+});
+
+test('registry report is read-only, classifies clients, counts tokens, and redacts both output formats', async () => {
+  const secret = 'sentinel-secret-not-a-real-credential';
+  const access = 'sentinel-access-not-a-real-token';
+  const refresh = 'sentinel-refresh-not-a-real-token';
+  const privateRedirect = 'https://client.example/private-callback?sentinel=private-query';
+  const now = Date.now();
+  db.prepare('UPDATE clients SET client_secret = ?').run(secret);
+  db.prepare('UPDATE clients SET redirect_uris = ?, scope = ? WHERE client_id = ?')
+    .run(JSON.stringify([privateRedirect, redirectUri, 'http://localhost:3080/callback']), 'read_only', clientId);
+  db.prepare('UPDATE clients SET redirect_uris = ? WHERE client_id = ?').run('[]', 'public-client');
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(now, 'legacy-client');
+  const old = now - 100 * 86400000;
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(old, clientId);
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(now - 30 * 86400000, 'other-client');
+  db.prepare('INSERT INTO access_tokens VALUES (?,?,?,?)').run(access, 'subject-one', clientId, now + 600000);
+  db.prepare('INSERT INTO access_tokens VALUES (?,?,?,?)').run('sentinel-expired-access', 'subject-two', clientId, now - 1000);
+  db.prepare('INSERT INTO refresh_tokens VALUES (?,?,?,?)').run(refresh, 'subject-one', clientId, null);
+  db.prepare('INSERT INTO refresh_tokens VALUES (?,?,?,?)')
+    .run('sentinel-expiring-refresh', 'subject-two', clientId, now + 600000);
+  db.prepare('INSERT INTO refresh_tokens VALUES (?,?,?,?)')
+    .run('sentinel-expired-refresh', 'subject-three', 'legacy-client', now - 1000);
+  const snapshot = () => ({
+    clients: db.prepare('SELECT * FROM clients ORDER BY client_id').all(),
+    access: db.prepare('SELECT * FROM access_tokens ORDER BY token').all(),
+    refresh: db.prepare('SELECT * FROM refresh_tokens ORDER BY token').all(),
+  });
+  const before = snapshot();
+  const script = path.join(root, 'scripts/registry-report.mjs');
+  const json = await runNode([script, '--json']);
+  const report = JSON.parse(json.stdout);
+  assert.deepEqual(report.clients.map((row) => row.client_id),
+    ['legacy-c', 'other-cl', 'test-cli', 'public-c']);
+  const live = report.clients.find((row) => row.client_id === clientId.slice(0, 8));
+  assert.deepEqual(live, {
+    client_id: 'test-cli',
+    redirect_origins: 'https://client.example, http://localhost:3080',
+    scope: 'read_only',
+    created_at: new Date(before.clients.find((row) => row.client_id === clientId).created_at).toISOString(),
+    last_used_at: new Date(old).toISOString(),
+    access: 1, refresh: 2, subjects: 2, flags: 'LIVE',
+  });
+  assert.equal(report.clients.find((row) => row.client_id === 'legacy-c').scope, 'full');
+  const inert = report.clients.find((row) => row.client_id === 'public-c');
+  assert.equal(inert.flags, 'INERT');
+  assert.equal(inert.redirect_origins, '(none)');
+  assert.equal(inert.last_used_at, 'never observed');
+  assert.deepEqual(report.summary, { total: 4, LIVE: 3, STALE: 0, INERT: 1, never_observed: 1 });
+  const custom = JSON.parse((await runNode([script, '--json', '--stale-days', '7'])).stdout);
+  assert.equal(custom.clients.find((row) => row.client_id === 'other-cl').flags, 'STALE');
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(old, 'other-client');
+  const aged = JSON.parse((await runNode([script, '--json'])).stdout);
+  assert.equal(aged.clients.find((row) => row.client_id === 'other-cl').flags, 'STALE');
+  db.prepare('UPDATE clients SET last_used_at = NULL WHERE client_id = ?').run('other-client');
+  const neverUsed = JSON.parse((await runNode([script, '--json'])).stdout);
+  assert.equal(neverUsed.clients.find((row) => row.client_id === 'other-cl').flags, 'STALE');
+  assert.deepEqual(neverUsed.summary, { total: 4, LIVE: 2, STALE: 1, INERT: 1, never_observed: 2 });
+  db.prepare('UPDATE clients SET last_used_at = ? WHERE client_id = ?').run(now - 30 * 86400000, 'other-client');
+  const human = await runNode([script]);
+  assert.match(human.stdout, /Total: 4 \| LIVE: 3 \| STALE: 0 \| INERT: 1 \| Never observed: 1/);
+  for (const result of [json, human]) {
+    assert.equal(result.stderr, '');
+    for (const value of [
+      secret, access, refresh, 'sentinel-expired-access', 'sentinel-expiring-refresh', 'sentinel-expired-refresh',
+      clientId, 'other-client', 'public-client', 'legacy-client', privateRedirect, redirectUri,
+      'private-callback', 'private-query', 'subject-one', 'subject-two', 'subject-three', 'client_secret',
+    ]) {
+      assert.ok(!result.stdout.includes(value), `report does not include ${value}`);
+    }
+  }
+  assert.deepEqual(snapshot(), before);
+});
+
+test('registry report rejects invalid options without echoing their values', async () => {
+  const script = path.join(root, 'scripts/registry-report.mjs');
+  for (const args of [
+    ['--stale-days', '0'], ['--stale-days', '-1'], ['--stale-days', '1.5'],
+    ['--stale-days', 'Infinity'], ['--stale-days'], ['--unknown-sentinel'],
+  ]) {
+    await assert.rejects(runNode([script, ...args]), (error) => {
+      assert.equal(error.code, 1);
+      assert.equal(error.stdout, '');
+      assert.match(error.stderr, /^Usage:/);
+      assert.ok(!error.stderr.includes('unknown-sentinel'));
+      return true;
+    });
+  }
+});
+
 test('unknown authorization client is rejected without changing clients or auth state', async () => {
   const clients = db.prepare('SELECT * FROM clients ORDER BY client_id').all();
   const response = await authorize({ client_id: 'unknown-client' });
@@ -302,9 +492,11 @@ test('localhost HTTP redirect URI is accepted while a hostile URI path is not re
 test('consent approval is single-use and only then creates auth state for the Accelo redirect', async () => {
   const authorization = await authorize({ state: 'test-client-state' });
   assert.equal(authorization.status, 200);
+  assert.equal(lastUsed(), null);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
   const { consentId, response: approved } = await consent(authorization);
   assert.equal(approved.status, 302);
+  assert.equal(lastUsed(), null);
   const acceloUrl = new URL(approved.headers.get('location'));
   assert.equal(acceloUrl.origin, `http://127.0.0.1:${upstream.address().port}`);
   const state = acceloUrl.searchParams.get('state');
@@ -369,6 +561,8 @@ for (const grant of ['authorization_code', 'refresh_token']) {
       const column = grant === 'authorization_code' ? 'code' : 'token';
       assert.ok(db.prepare(`SELECT * FROM ${table} WHERE ${column} = ?`).get(value));
       assert.equal(db.prepare('SELECT COUNT(*) AS count FROM access_tokens').get().count, 0);
+      assert.equal(lastUsed(), null);
+      assert.equal(lastUsed('other-client'), null);
     });
   }
 
@@ -391,6 +585,7 @@ for (const [name, codeVerifier] of [['missing', undefined], ['empty', ''], ['inc
     assert.equal(response.status, 400);
     assert.equal((await response.json()).error, 'invalid_grant');
     assert.ok(db.prepare('SELECT * FROM auth_codes WHERE code = ?').get(code));
+    assert.equal(lastUsed(), null);
   });
 }
 

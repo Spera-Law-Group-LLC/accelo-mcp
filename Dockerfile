@@ -12,6 +12,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY src ./src
+COPY scripts/registry-report.mjs ./scripts/registry-report.mjs
 RUN mkdir -p /app/data
 
 EXPOSE 8787
