@@ -71,7 +71,7 @@ Copy `.env.example` to `.env` and fill in:
 | `OAUTH_REDIRECT_URI` | `<PUBLIC_BASE_URL>/oauth/callback` (must match Accelo) |
 | `OAUTH_SCOPE` | Accelo scopes, e.g. `read(all) write(all)` |
 | `TOKEN_DB_PATH` | SQLite path (default `/app/data/tokens.db`) |
-| `PORT` | Listen port (default `8787`) |
+| `PORT` | Listen port (default `8787`, inside the container) |
 
 Never commit `.env` (it is gitignored).
 
@@ -81,11 +81,12 @@ Never commit `.env` (it is gitignored).
 
 ```bash
 docker compose up -d --build
-curl -s http://127.0.0.1:8787/healthz
+curl -s http://127.0.0.1:8788/healthz
 ```
 
-The compose file publishes only on loopback (`127.0.0.1:8787`). Put a TLS
-reverse proxy (nginx, Caddy, etc.) in front of it for `PUBLIC_BASE_URL`.
+The compose file publishes only on loopback (`127.0.0.1:8788`), mapping host
+port 8788 to container port 8787. Put a TLS reverse proxy (nginx, Caddy, etc.)
+in front of it for `PUBLIC_BASE_URL`.
 
 ### Node
 

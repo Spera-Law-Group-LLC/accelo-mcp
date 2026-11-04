@@ -96,9 +96,13 @@ baked into the **running image**, not just present on the host disk:
 docker compose exec accelo-mcp grep -c "list_issues" /app/src/issues.js
 
 # Health is necessary but NOT sufficient — check it, but never treat it as proof
-# of fresh code:
-curl -s http://127.0.0.1:8787/healthz
+# of fresh code. Compose maps host port 8788 to in-container port 8787:
+curl -s http://127.0.0.1:8788/healthz
 ```
+
+If the loopback check is non-200, confirm against
+`https://<your-public-host>/healthz` before concluding the service is down;
+another service occupies host port 8787.
 
 If the in-image `grep` count is 0, the container is running stale code even
 though it is `Up` and healthy. Rebuild without cache and re-assert:
