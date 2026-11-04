@@ -119,8 +119,26 @@ summary counts. It never outputs secrets, token values, or full redirect URIs.
 `never observed` means no use recorded since activity tracking was introduced;
 existing clients are not backfilled. Successful token issuance/rotation and
 authenticated MCP requests record activity, at most once per client per minute.
-The report does not delete clients or revoke tokens. Run inside the container or
-as `deploy`: the database is mode `0600`; do not widen its permissions.
+The default report does not delete clients or revoke tokens.
+
+```bash
+docker compose exec accelo-mcp node scripts/registry-report.mjs --prune
+docker compose exec accelo-mcp node scripts/registry-report.mjs --prune --confirm
+```
+
+`--prune` is a read-only dry run: it lists the eligible rows with the same
+redaction as the report, then the total. Only `--prune --confirm` authorizes
+irreversible deletion; `--confirm` without `--prune` is an error. Pruning deletes
+only client rows holding **no access or refresh token records**, with no observed
+last use and created more than 24 hours ago. Any token record, even an expired one,
+protects its client from deletion. The fixed 24-hour guard protects registrations
+still in progress; `--stale-days` does not affect eligibility.
+Pruning does not delete tokens or revoke anything at Accelo.
+Confirmed pruning prints the actual deleted count and the resulting summary.
+This is operator-only, never scheduled.
+
+Run inside the container or as `deploy`: the database is mode `0600`; do not widen
+its permissions.
 
 ## Endpoints
 
