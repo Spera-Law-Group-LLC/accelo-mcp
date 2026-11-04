@@ -99,15 +99,10 @@ app.get('/authorize', authorizeLimiter, (req, res) => {
   if (!client_id) return res.status(400).send('missing client_id');
   if (!redirect_uri) return res.status(400).send('missing redirect_uri');
 
-  // Accept both dynamically-registered clients and manually-entered client_ids
-  // (some MCP clients require a Client ID field and do not perform DCR). If we
-  // have not seen this client_id before, lazily register it and PIN the supplied
-  // redirect_uri as its sole registered URI.
-  let client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
+  const client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
   if (!client) {
-    db.prepare('INSERT OR IGNORE INTO clients (client_id, client_secret, redirect_uris, created_at) VALUES (?,?,?,?)')
-      .run(client_id, null, JSON.stringify([redirect_uri]), now());
-    client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
+    log('[authorize] unauthorized_client');
+    return res.status(400).json({ error: 'unauthorized_client' });
   }
 
   // SECURITY (#21): the redirect_uri MUST be one of the client's registered
@@ -124,10 +119,15 @@ app.get('/authorize', authorizeLimiter, (req, res) => {
     return res.status(400).send('redirect_uri_mismatch');
   }
 
+  if (typeof code_challenge !== 'string' || !code_challenge ||
+      (code_challenge_method !== undefined && code_challenge_method !== 'S256')) {
+    return res.status(400).send('invalid_request');
+  }
+
   const ourState = rand(16);
   db.prepare(
     'INSERT INTO auth_state (state, client_id, client_redirect_uri, client_state, code_challenge, code_challenge_method, created_at) VALUES (?,?,?,?,?,?,?)'
-  ).run(ourState, client_id, redirect_uri, state || null, code_challenge || null, code_challenge_method || null, now());
+  ).run(ourState, client_id, redirect_uri, state || null, code_challenge, code_challenge_method || 'S256', now());
 
   const u = new URL(`${config.acceloOAuthUrl}/authorize`);
   u.searchParams.set('response_type', 'code');
@@ -193,17 +193,32 @@ app.get('/oauth/callback', callbackLimiter, async (req, res) => {
 });
 
 // ---- Token endpoint ----
+function validTokenClient(client_id, client_secret, expectedClientId) {
+  if (typeof client_id !== 'string' || !client_id || client_id !== expectedClientId) return false;
+  const client = db.prepare('SELECT * FROM clients WHERE client_id = ?').get(client_id);
+  if (!client) return false;
+  if (client.client_secret === null) return true;
+  if (typeof client_secret !== 'string' || !client_secret) return false;
+  const supplied = Buffer.from(client_secret);
+  const expected = Buffer.from(client.client_secret);
+  return supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected);
+}
+
 app.post('/token', tokenLimiter, (req, res) => {
-  const { grant_type, code, code_verifier, refresh_token } = req.body;
+  const { grant_type, code, code_verifier, refresh_token, client_id, client_secret } = req.body;
 
   if (grant_type === 'authorization_code') {
     const ac = db.prepare('SELECT * FROM auth_codes WHERE code = ?').get(code);
     if (!ac || ac.expires_at < now()) return res.status(400).json({ error: 'invalid_grant' });
-    if (ac.code_challenge) {
-      const hash = crypto.createHash('sha256').update(code_verifier || '').digest('base64url');
-      if (hash !== ac.code_challenge) {
-        return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
-      }
+    if (!validTokenClient(client_id, client_secret, ac.client_id)) {
+      return res.status(400).json({ error: 'invalid_client' });
+    }
+    if (typeof code_verifier !== 'string' || !code_verifier) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+    }
+    const hash = crypto.createHash('sha256').update(code_verifier).digest('base64url');
+    if (hash !== ac.code_challenge) {
+      return res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
     }
     db.prepare('DELETE FROM auth_codes WHERE code = ?').run(code);
     const accessToken = rand(32);
@@ -221,6 +236,9 @@ app.post('/token', tokenLimiter, (req, res) => {
     // legacy rows minted before the migration; treat NULL as still-valid once,
     // then rotate it into an expiring token below).
     if (!rt) return res.status(400).json({ error: 'invalid_grant' });
+    if (!validTokenClient(client_id, client_secret, rt.client_id)) {
+      return res.status(400).json({ error: 'invalid_client' });
+    }
     if (rt.expires_at != null && rt.expires_at < now()) {
       db.prepare('DELETE FROM refresh_tokens WHERE token = ?').run(refresh_token);
       return res.status(400).json({ error: 'invalid_grant', error_description: 'refresh token expired' });
