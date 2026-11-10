@@ -568,7 +568,13 @@ export function registerProjectTools(server, subject) {
     { job_id: z.string().regex(/^\d+$/, 'job_id must be a numeric ID').describe('Numeric Accelo job ID') },
     async ({ job_id }) => {
       const token = await getValidAcceloToken(subject);
-      const json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}`, { _fields: JOB_FIELDS });
+      let json;
+      try {
+        json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}`, { _fields: JOB_FIELDS });
+      } catch (error) {
+        if (error.message?.includes(' 404')) return ok({ status: 'not_found', object_type: 'job' });
+        throw error;
+      }
       const job = Array.isArray(json.response) ? json.response[0] : json.response;
       if (!job || job.id == null) return ok({ status: 'not_found', object_type: 'job' });
       return ok({

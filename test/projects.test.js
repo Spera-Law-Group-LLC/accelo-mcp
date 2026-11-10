@@ -175,7 +175,8 @@ function mockJobReads(t, handler) {
   t.mock.method(globalThis, 'fetch', async (input) => {
     const url = new URL(input);
     requests.push(url);
-    return Response.json(await handler(url));
+    const response = await handler(url);
+    return response instanceof Response ? response : Response.json(response);
   });
   return requests;
 }
@@ -228,6 +229,18 @@ test('get_job returns a typed not_found for an ID that is not a job', async (t) 
 
   assert.deepEqual(result, { status: 'not_found', object_type: 'job' });
   assert.deepEqual(requests.map((url) => url.pathname), ['/api/v0/jobs/321']);
+});
+
+test('get_job returns a typed not_found when Accelo responds with HTTP 404', async (t) => {
+  const requests = mockJobReads(t, async (url) => {
+    assert.equal(url.pathname, '/api/v0/jobs/321');
+    return new Response(JSON.stringify({ meta: { message: 'Not found' } }), { status: 404 });
+  });
+
+  const result = await callTool('get_job', { job_id: '321' });
+
+  assert.deepEqual(result, { status: 'not_found', object_type: 'job' });
+  assert.equal(requests.length, 1);
 });
 
 test('get_job and get_project_plan expose job company references', async (t) => {
