@@ -88,9 +88,14 @@ test('retry wait is capped at 20 seconds for the whole tool call', async (t) => 
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     calls += 1;
-    return response(429, { 'Retry-After': '10' });
+    if (calls === 1) return response(429, { 'Retry-After': '10' });
+    if (calls === 2) return Response.json({ response: [] });
+    return response(429, { 'Retry-After': '15' });
   });
-  await assert.rejects(withAcceloRetryBudget(() => acceloGet('token', '/test')), { status: 429 });
+  await assert.rejects(withAcceloRetryBudget(async () => {
+    await acceloGet('token', '/first');
+    await acceloGet('token', '/second');
+  }), { status: 429 });
   assert.equal(calls, 3);
   assert.deepEqual(delays, [10000, 10000]);
 });

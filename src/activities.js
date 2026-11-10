@@ -438,7 +438,9 @@ export function registerActivityTools(server, subject) {
       const activityWindow = await fetchActivityPage(token, `against(${against_type}(${against_id}))`, activityCap, 0);
       const attachments = [];
       let resourceCapped = false;
+      let activitiesProcessed = 0;
       for (const activity of activityWindow.activities) {
+        activitiesProcessed += 1;
         const result = await fetchActivityAttachments(token, activity.id);
         resourceCapped ||= result.has_more;
         for (const attachment of result.attachments) {
@@ -464,7 +466,7 @@ export function registerActivityTools(server, subject) {
         limit,
         has_more: attachments.length > start + limit || capped,
         capped,
-        activities_gathered: activityWindow.activities.length,
+        activities_gathered: activitiesProcessed,
         attachments_gathered: attachments.length,
         activity_cap: activityCap,
         attachment_cap: attachmentCap,
