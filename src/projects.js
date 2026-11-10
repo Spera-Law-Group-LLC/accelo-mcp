@@ -4,8 +4,9 @@ import { getValidAcceloToken } from './oauth.js';
 
 // Project-planning module for the Accelo MCP.
 //
-// Reads:  get_project_plan, list_tasks, get_task, list_task_progressions,
-//         get_project_profile_values, list_project_activities.
+// Reads:  list_jobs, get_job, get_project_plan, list_tasks, get_task,
+//         list_task_progressions, get_project_profile_values,
+//         list_project_activities.
 // Writes (confirm:true-guarded): update_task, create_task, progress_task,
 //   cancel_task, reschedule_plan (bulk tasks).
 //
@@ -69,8 +70,8 @@ const CANCEL_PROGRESSION_ID = '14';
 
 const JOB_FIELDS = [
   'id', 'title', 'standing', 'job_status', 'manager', 'against', 'against_type',
-  'against_id', 'date_started', 'date_due', 'date_commenced', 'date_completed',
-  'comments',
+  'against_id', 'company', 'affiliation', 'date_started', 'date_due',
+  'date_commenced', 'date_completed', 'comments',
 ].join(',');
 
 const MILESTONE_FIELDS = [
@@ -93,6 +94,51 @@ const ACTIVITY_LIST_FIELDS = [
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+}
+
+function jobUrl(id) {
+  const apiUrl = new URL(config.acceloBaseUrl);
+  apiUrl.hostname = apiUrl.hostname.replace(/\.api\.accelo\.com$/, '.accelo.com');
+  return new URL(`/?action=view_job&id=${encodeURIComponent(id)}`, apiUrl.origin).toString();
+}
+
+function relationId(value) {
+  if (value && typeof value === 'object') return value.id ?? value.company_id ?? null;
+  return value ?? null;
+}
+
+function jobCompanyIds(job) {
+  if (!job || typeof job !== 'object') return [];
+  const ids = [];
+  if (job.against_type === 'company' && job.against_id != null) ids.push(job.against_id);
+  const companyId = relationId(job.company) ?? job.company_id;
+  if (companyId != null) ids.push(companyId);
+  const affiliationCompanyId = job.affiliation?.company_id ?? relationId(job.affiliation?.company);
+  if (affiliationCompanyId != null) ids.push(affiliationCompanyId);
+  return ids.map(String);
+}
+
+function companyMismatchCount(rows, companyId) {
+  return rows.filter((job) => {
+    const companyIds = jobCompanyIds(job);
+    return companyIds.length === 0 || companyIds.some((id) => id !== String(companyId));
+  }).length;
+}
+
+function profileValues(rows, fieldId) {
+  return rows
+    .map((row) => {
+      const valueId = row.value_id ?? row.id ?? null;
+      return {
+        ...row,
+        field_id: row.field_id ?? row.profile_field_id ?? row.field?.id ?? row.profile_field?.id ?? null,
+        value_id: valueId,
+        id: valueId,
+        field_name: row.field_name ?? row.profile_field_name ?? row.field?.name ?? row.profile_field?.name ?? null,
+        field_type: row.field_type ?? row.profile_field_type ?? row.field?.type ?? row.profile_field?.type ?? null,
+      };
+    })
+    .filter((row) => fieldId === undefined || String(row.field_id) === fieldId);
 }
 
 // Human-in-the-loop guard: returned when a write tool is called without
@@ -343,10 +389,18 @@ async function getProjectPlan(token, jobId) {
     job: job ? {
       id: job.id,
       title: job.title,
+      against: job.against,
+      against_type: job.against_type,
+      against_id: job.against_id,
+      company: job.company,
+      affiliation: job.affiliation,
       standing: job.standing,
+      job_status: job.job_status,
       manager: job.manager,
       planned_start: tsToISO(job.date_started),
       planned_due: tsToISO(job.date_due),
+      date_started: job.date_started,
+      date_completed: job.date_completed,
     } : { id: jobId, note: 'job record not returned' },
     milestones: milestoneNodes,
     job_level_tasks: jobTasks,
@@ -436,6 +490,113 @@ function planItemBody(item) {
 export function registerProjectTools(server, subject) {
   // -------- Reads --------
   server.tool(
+    'list_jobs',
+    'List Accelo jobs for a company, returning company references, standing, status, dates, and a stable Accelo link. Pages are zero-based; when has_more is true, request the next page with the same limit. Read-only.',
+    {
+      company_id: z.string().regex(/^\d+$/, 'company_id must be a numeric ID').describe('Numeric Accelo company ID'),
+      standing: z.array(z.enum(['active', 'inactive', 'paused', 'closed', 'complete'])).optional()
+        .describe('Optional standings to include; values are passed through as Accelo returns them.'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max jobs per page (default 50)'),
+      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0)'),
+    },
+    async ({ company_id, standing, limit = 50, page = 0 }) => {
+      const token = await getValidAcceloToken(subject);
+      const filters = ['against_type(company)', `against_id(${company_id})`];
+      if (standing?.length) filters.push(`standing(${standing.join('|')})`);
+
+      // Accelo's company filter expression must be verified against the live
+      // API before relying on it; returned company references are checked below.
+      async function fetchJobs(upstreamPage) {
+        const json = await acceloGet(token, '/jobs', {
+          _fields: JOB_FIELDS,
+          _filters: filters.join(','),
+          _limit: limit + 1,
+          _page: upstreamPage,
+        });
+        const rows = Array.isArray(json.response) ? json.response : [];
+        return {
+          rows,
+          mismatchCount: companyMismatchCount(rows, company_id),
+          total: json.meta?.total ?? json.total,
+        };
+      }
+
+      const size = limit + 1;
+      const start = page * limit;
+      const upstreamPage = Math.floor(start / size);
+      const offset = start % size;
+      const first = await fetchJobs(upstreamPage);
+      if (first.mismatchCount > 0) {
+        return ok({ status: 'filter_not_applied', mismatch_count: first.mismatchCount });
+      }
+      let rows = first.rows;
+      let total = first.total;
+      if (offset > 0 && rows.length === size) {
+        const next = await fetchJobs(upstreamPage + 1);
+        if (next.mismatchCount > 0) {
+          return ok({ status: 'filter_not_applied', mismatch_count: next.mismatchCount });
+        }
+        rows = rows.concat(next.rows);
+        if (total == null) total = next.total;
+      }
+
+      const window = rows.slice(offset, offset + size);
+      const jobs = window.slice(0, limit).map((job) => ({
+        id: job.id,
+        title: job.title,
+        against_type: job.against_type,
+        against_id: job.against_id,
+        company: job.company,
+        company_id: relationId(job.company) ?? job.company_id ?? (job.against_type === 'company' ? job.against_id : undefined),
+        affiliation: job.affiliation,
+        affiliation_id: relationId(job.affiliation) ?? job.affiliation_id,
+        standing: job.standing,
+        job_status: job.job_status,
+        date_started: job.date_started,
+        date_completed: job.date_completed,
+        url: jobUrl(job.id),
+      }));
+      const result = { jobs, page, limit, has_more: window.length > limit };
+      if (total != null) result.total = total;
+      return ok(result);
+    }
+  );
+
+  server.tool(
+    'get_job',
+    'Get a single Accelo job by ID, including its company reference, standing, status, dates, and stable Accelo link. Read-only.',
+    { job_id: z.string().regex(/^\d+$/, 'job_id must be a numeric ID').describe('Numeric Accelo job ID') },
+    async ({ job_id }) => {
+      const token = await getValidAcceloToken(subject);
+      let json;
+      try {
+        json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}`, { _fields: JOB_FIELDS });
+      } catch (error) {
+        if (error.message?.includes(' 404')) return ok({ status: 'not_found', object_type: 'job' });
+        throw error;
+      }
+      const job = Array.isArray(json.response) ? json.response[0] : json.response;
+      if (!job || job.id == null) return ok({ status: 'not_found', object_type: 'job' });
+      return ok({
+        id: job.id,
+        title: job.title,
+        against: job.against,
+        against_type: job.against_type,
+        against_id: job.against_id,
+        company: job.company,
+        company_id: relationId(job.company) ?? job.company_id ?? (job.against_type === 'company' ? job.against_id : undefined),
+        affiliation: job.affiliation,
+        affiliation_id: relationId(job.affiliation) ?? job.affiliation_id,
+        standing: job.standing,
+        job_status: job.job_status,
+        date_started: job.date_started,
+        date_completed: job.date_completed,
+        url: jobUrl(job.id),
+      });
+    }
+  );
+
+  server.tool(
     'get_project_plan',
     'Get the full project plan for an Accelo job: the job, its milestones (ordered), the tasks under each milestone (ordered), any tasks attached directly to the job, and a waiting_summary of tasks currently waiting on a client or third party (native task_status 8/12). Dates are shown as ISO (YYYY-MM-DD) planned vs actual, in the deployment timezone. Milestone dates are read-only and derive from their tasks. Read-only.',
     { job_id: z.string().describe('The Accelo job (project) ID, e.g. "862"') },
@@ -487,14 +648,18 @@ export function registerProjectTools(server, subject) {
 
   server.tool(
     'get_project_profile_values',
-    'Get custom profile field values for a project (job). Returns all profile fields including Project/Issue Folder (a Google Drive URL \u2014 extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
-    { job_id: z.string().describe('The Accelo job (project) ID') },
-    async ({ job_id }) => {
+    'Get custom profile field values for a project (job). Returns all profile fields including Project/Issue Folder (a Google Drive URL \u2014 extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_id (definition ID), value_id (value-record ID), field_name, value, field_type, and id as a back-compat alias of value_id. Read-only.',
+    {
+      job_id: z.string().describe('The Accelo job (project) ID'),
+      field_id: z.string().regex(/^\d+$/, 'field_id must be a numeric ID').optional().describe('Return only this profile-field definition ID'),
+    },
+    async ({ job_id, field_id }) => {
       const token = await getValidAcceloToken(subject);
       const json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}/profiles/values`, {
+        _fields: 'id,value,field_id,field_name,field_type',
         _limit: 100,
       });
-      return ok(json.response || []);
+      return ok(profileValues(Array.isArray(json.response) ? json.response : [], field_id));
     }
   );
 

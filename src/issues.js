@@ -81,6 +81,37 @@ function buildIssueFilters({ against_type, against_id, affiliation_id, contract_
   return parts.join(',');
 }
 
+function relationId(value) {
+  if (value && typeof value === 'object') return value.id ?? value.affiliation_id ?? null;
+  return value ?? null;
+}
+
+function issueMatchesScope(issue, { against_type, against_id, affiliation_id }) {
+  if (against_type !== undefined && String(issue.against_type) !== against_type) return false;
+  if (against_id !== undefined && String(issue.against_id) !== against_id) return false;
+  if (affiliation_id !== undefined) {
+    const id = issue.affiliation_id ?? relationId(issue.affiliation);
+    if (id == null || String(id) !== affiliation_id) return false;
+  }
+  return true;
+}
+
+function profileValues(rows, fieldId) {
+  return rows
+    .map((row) => {
+      const valueId = row.value_id ?? row.id ?? null;
+      return {
+        ...row,
+        field_id: row.field_id ?? row.profile_field_id ?? row.field?.id ?? row.profile_field?.id ?? null,
+        value_id: valueId,
+        id: valueId,
+        field_name: row.field_name ?? row.profile_field_name ?? row.field?.name ?? row.profile_field?.name ?? null,
+        field_type: row.field_type ?? row.profile_field_type ?? row.field?.type ?? row.profile_field?.type ?? null,
+      };
+    })
+    .filter((row) => fieldId === undefined || String(row.field_id) === fieldId);
+}
+
 export function registerIssueTools(server, subject) {
   server.tool(
     'get_issue',
@@ -97,7 +128,7 @@ export function registerIssueTools(server, subject) {
 
   server.tool(
     'list_issues',
-    'List or search Accelo issues (tickets), newest first. Returns only issues the authorized user can see (Accelo applies the user\'s own permissions to every query). Use this to discover an issue_id, then call get_issue / get_issue_profile_values / list_issue_activities for detail. Each structured filter is optional and combinable. The raw `filters` parameter is an advanced escape hatch: it is forwarded VERBATIM to Accelo and BYPASSES the structured-filter scoping above (it can broaden or narrow results in ways the structured params cannot express) — prefer the structured params unless you specifically need raw Accelo _filters syntax. Read-only.',
+    'List or search Accelo issues (tickets), newest first. Returns only issues the authorized user can see (Accelo applies the user\'s own permissions to every query). Use this to discover an issue_id, then call get_issue / get_issue_profile_values / list_issue_activities for detail. Each structured filter is optional and combinable. Company/against and affiliation scopes are checked against every returned issue; a mismatch fails visibly. The raw `filters` parameter is an advanced escape hatch: it is forwarded VERBATIM to Accelo and BYPASSES structured-filter verification; raw-filter results include scope_verified: false. Read-only.',
     {
       against_type: z.enum(AGAINST_TYPES).optional().describe('Object type the issue is logged against, e.g. "company". Pair with against_id.'),
       against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').optional().describe('Numeric ID of the object the issue is against. Pair with against_type.'),
@@ -142,22 +173,35 @@ export function registerIssueTools(server, subject) {
         list = Array.isArray(json.response) ? json.response : [];
       }
 
+      const scoped = args.against_type !== undefined || args.against_id !== undefined || args.affiliation_id !== undefined;
+      if (scoped && !args.filters) {
+        const mismatchCount = list.filter((issue) => !issueMatchesScope(issue, args)).length;
+        if (mismatchCount > 0) {
+          return ok({ status: 'filter_not_applied', mismatch_count: mismatchCount });
+        }
+      }
+
       // Guarantee newest-first regardless of server-side ordering support.
       list.sort((a, b) => Number(b.date_created || 0) - Number(a.date_created || 0));
+      if (args.filters) return ok({ issues: list, scope_verified: false });
       return ok(list);
     }
   );
 
   server.tool(
     'get_issue_profile_values',
-    'Get custom profile field values for an Accelo issue (ticket). Returns all profile fields including Project/Issue Folder (a Google Drive URL — extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_name, value, field_type, and id. Read-only.',
-    { issue_id: z.string().describe('The Accelo issue ID') },
-    async ({ issue_id }) => {
+    'Get custom profile field values for an Accelo issue (ticket). Returns all profile fields including Project/Issue Folder (a Google Drive URL — extract the Drive folder ID from it), AI Summary, AI Next Steps, and other deployment-specific custom fields. Each value includes field_id (definition ID), value_id (value-record ID), field_name, value, field_type, and id as a back-compat alias of value_id. Read-only.',
+    {
+      issue_id: z.string().describe('The Accelo issue ID'),
+      field_id: z.string().regex(/^\d+$/, 'field_id must be a numeric ID').optional().describe('Return only this profile-field definition ID'),
+    },
+    async ({ issue_id, field_id }) => {
       const token = await getValidAcceloToken(subject);
       const json = await acceloGet(token, `/issues/${encodeURIComponent(issue_id)}/profiles/values`, {
+        _fields: 'id,value,field_id,field_name,field_type',
         _limit: 100,
       });
-      return ok(json.response || []);
+      return ok(profileValues(Array.isArray(json.response) ? json.response : [], field_id));
     }
   );
 
