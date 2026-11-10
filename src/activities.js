@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
 import { fetchWindow } from './pagination.js';
+import { acceloGet, acceloPost } from './accelo.js';
 
 // Activities module for the Accelo MCP: read interaction history (notes, emails,
 // meetings, calls) and push notes/emails/time into Accelo, with threading,
@@ -103,47 +103,6 @@ function needsConfirmation(action, payload) {
 function mapAgainstType(t) {
   const key = String(t || '').toLowerCase();
   return AGAINST_TYPE_MAP[key] || key;
-}
-
-async function acceloGet(token, pathname, query) {
-  const url = new URL(config.acceloBaseUrl + pathname);
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    }
-  }
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && json.meta && json.meta.message) || text;
-    log('ERROR GET', pathname, res.status, '-', msg);
-    throw new Error(`Accelo API GET ${pathname} failed: ${res.status} ${msg}`);
-  }
-  return json;
-}
-
-async function acceloPost(token, pathname, body) {
-  const url = new URL(config.acceloBaseUrl + pathname);
-  const opts = {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  };
-  if (body && Object.keys(body).length) {
-    opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-    opts.body = new URLSearchParams(body).toString();
-  }
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && json.meta && json.meta.message) || text;
-    log('ERROR POST', pathname, res.status, '-', msg);
-    throw new Error(`Accelo API POST ${pathname} failed: ${res.status} ${msg}`);
-  }
-  return json;
 }
 
 function tsToISO(ts) {
@@ -264,6 +223,31 @@ async function fetchActivities(token, againstType, againstId, { medium, limit = 
   return fetchActivityPage(token, filters.join(','), limit, page);
 }
 
+async function fetchActivityAttachments(token, activityId) {
+  const window = await fetchWindow(async (upstreamPage, size) => {
+    const json = await acceloGet(token, '/resources', {
+      _filters: `activity_id(${activityId})`,
+      _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,activity_id',
+      _limit: size,
+      _page: upstreamPage,
+    });
+    if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
+    return json.response;
+  }, 100, 0);
+  return {
+    attachments: window.slice(0, 100).map((row) => ({
+      id: row.id,
+      title: row.title,
+      filename: row.filename,
+      mimetype: row.mimetype ?? row.mime_type,
+      filesize: row.filesize,
+      date_created: row.date_created,
+      activity_id: String(activityId),
+    })),
+    has_more: window.length > 100,
+  };
+}
+
 // Core create. Returns the created activity (decorated) after a re-GET so the
 // response reflects stored values.
 async function createActivity(token, fields) {
@@ -349,7 +333,7 @@ export function registerActivityTools(server, subject) {
       against_id: z.string().describe('ID of the parent object'),
       medium: z.enum(['note', 'email', 'meeting', 'call']).optional().describe('Filter to one medium'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 50)'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
     },
     async ({ against_type, against_id, medium, limit, page }) => {
       const token = await getValidAcceloToken(subject);
@@ -393,7 +377,7 @@ export function registerActivityTools(server, subject) {
     {
       id: z.string().describe('Any activity ID within the thread'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results, newest first (default 100)'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
     },
     async ({ id, limit = 100, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
@@ -401,6 +385,89 @@ export function registerActivityTools(server, subject) {
       if (!one) return ok({ status: 'error', message: 'Activity not found' });
       const threadId = one.thread_id || id;
       return ok({ thread_id: threadId, ...await fetchActivityPage(token, `thread(${threadId})`, limit, page) });
+    }
+  );
+
+  server.tool(
+    'list_activity_attachments',
+    'List attachment metadata for one Accelo activity. Does not download file contents. Pages are zero-based; when has_more is true, request the next page with the same limit. Read-only.',
+    {
+      activity_id: z.string().regex(/^\d+$/, 'activity_id must be a numeric ID').describe('Numeric activity ID'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results per page (default 50)'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
+    },
+    async ({ activity_id, limit = 50, page = 0 }) => {
+      const token = await getValidAcceloToken(subject);
+      const window = await fetchWindow(async (upstreamPage, size) => {
+        const json = await acceloGet(token, '/resources', {
+          _filters: `activity_id(${activity_id})`,
+          _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,activity_id',
+          _limit: size,
+          _page: upstreamPage,
+        });
+        if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
+        return json.response;
+      }, limit, page);
+      const attachments = window.slice(0, limit).map((row) => ({
+        id: row.id,
+        title: row.title,
+        filename: row.filename,
+        mimetype: row.mimetype ?? row.mime_type,
+        filesize: row.filesize,
+        date_created: row.date_created,
+        activity_id: row.activity_id ?? activity_id,
+      }));
+      return ok({ activity_id, attachments, page, limit, has_more: window.length > limit });
+    }
+  );
+
+  server.tool(
+    'list_matter_attachments',
+    'List attachment metadata across a job or issue’s activities, including each activity subject and logged date. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request the next page with the same limit. Read-only.',
+    {
+      against_type: z.enum(['job', 'issue']).describe('Matter type'),
+      against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results per page (default 50)'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
+    },
+    async ({ against_type, against_id, limit = 50, page = 0 }) => {
+      const token = await getValidAcceloToken(subject);
+      const activityCap = 100;
+      const attachmentCap = 1000;
+      const activityWindow = await fetchActivityPage(token, `against(${against_type}(${against_id}))`, activityCap, 0);
+      const attachments = [];
+      let resourceCapped = false;
+      for (const activity of activityWindow.activities) {
+        const result = await fetchActivityAttachments(token, activity.id);
+        resourceCapped ||= result.has_more;
+        for (const attachment of result.attachments) {
+          if (attachments.length >= attachmentCap) {
+            resourceCapped = true;
+            break;
+          }
+          attachments.push({
+            ...attachment,
+            activity_id: String(activity.id),
+            activity_subject: activity.subject,
+            date_logged: activity.date_logged,
+          });
+        }
+        if (attachments.length >= attachmentCap) break;
+      }
+      const activityCapped = activityWindow.has_more;
+      const capped = activityCapped || resourceCapped;
+      const start = page * limit;
+      return ok({
+        attachments: attachments.slice(start, start + limit),
+        page,
+        limit,
+        has_more: attachments.length > start + limit || capped,
+        capped,
+        activities_gathered: activityWindow.activities.length,
+        attachments_gathered: attachments.length,
+        activity_cap: activityCap,
+        attachment_cap: attachmentCap,
+      });
     }
   );
 

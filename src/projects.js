@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
 import { fetchWindow } from './pagination.js';
+import { acceloGet, acceloPost, acceloPut, acceloTryPost } from './accelo.js';
 
 // Project-planning module for the Accelo MCP.
 //
@@ -151,70 +152,6 @@ function needsConfirmation(action, diff) {
     message: `This will ${action} in Accelo. Review the change below with the user, then call this tool again with confirm: true to proceed.`,
     change: diff,
   });
-}
-
-async function acceloGet(token, pathname, query) {
-  const url = new URL(config.acceloBaseUrl + pathname);
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    }
-  }
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && json.meta && json.meta.message) || text;
-    log('ERROR GET', pathname, res.status, '-', msg);
-    const error = new Error(`Accelo API GET ${pathname} failed: ${res.status} ${msg}`);
-    error.status = res.status;
-    throw error;
-  }
-  return json;
-}
-
-// Write helper for POST/PUT. Body is form-urlencoded (Accelo's format).
-async function acceloWrite(token, method, pathname, body) {
-  const url = new URL(config.acceloBaseUrl + pathname);
-  const opts = {
-    method,
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  };
-  if (body && Object.keys(body).length) {
-    opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-    opts.body = new URLSearchParams(body).toString();
-  }
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && json.meta && json.meta.message) || text;
-    log('ERROR', method, pathname, res.status, '-', msg);
-    throw new Error(`Accelo API ${method} ${pathname} failed: ${res.status} ${msg}`);
-  }
-  return json;
-}
-
-// Non-throwing POST used for progression attempts (we try multiple shapes).
-async function acceloTryPost(token, pathname, body) {
-  const url = new URL(config.acceloBaseUrl + pathname);
-  const opts = {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  };
-  if (body && Object.keys(body).length) {
-    opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
-    opts.body = new URLSearchParams(body).toString();
-  }
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  return { ok: res.ok, status: res.status, json, message: (json && json.meta && json.meta.message) || text };
 }
 
 // Run a task progression. Accelo deployments differ on the exact endpoint
@@ -500,7 +437,7 @@ export function registerProjectTools(server, subject) {
       standing: z.array(z.enum(['active', 'inactive', 'paused', 'closed', 'complete'])).optional()
         .describe('Optional standings to include; values are passed through as Accelo returns them.'),
       limit: z.number().int().min(1).max(100).optional().describe('Max jobs per page (default 50)'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0)'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number (default 0)'),
     },
     async ({ company_id, standing, limit = 50, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
@@ -559,6 +496,7 @@ export function registerProjectTools(server, subject) {
       try {
         json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}`, { _fields: JOB_FIELDS });
       } catch (error) {
+        // Accelo returned 400 for a nonexistent job ID when verified live on 2026-11-10; 401/403 still surface.
         if (error.status === 400 || error.status === 404) return ok({ status: 'not_found', object_type: 'job' });
         throw error;
       }
@@ -656,7 +594,7 @@ export function registerProjectTools(server, subject) {
     {
       job_id: z.string().describe('The Accelo job (project) ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max total results after merge (default 50)'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0)'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number (default 0)'),
     },
     async ({ job_id, limit, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
@@ -765,7 +703,7 @@ export function registerProjectTools(server, subject) {
       if (!current) return ok({ status: 'error', message: `Task ${id} not found.` });
       const diff = buildTaskDiff(current, body);
       if (confirm !== true) return needsConfirmation(`UPDATE task ${id} ("${current.title}")`, diff);
-      await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, body);
+      await acceloPut(token, `/tasks/${encodeURIComponent(id)}`, body);
       // Re-GET so the response reflects the true stored dates (the write
       // response can omit/return null for date fields).
       const after = await getTask(token, id);
@@ -805,7 +743,7 @@ export function registerProjectTools(server, subject) {
         assignee_id,
       };
       if (confirm !== true) return needsConfirmation('CREATE a new task', preview);
-      const res = await acceloWrite(token, 'POST', '/tasks', body);
+      const res = await acceloPost(token, '/tasks', body);
       const newId = res.response && res.response.id;
       const after = newId ? await getTask(token, newId) : res.response;
       return ok({ status: 'created', task: after ? decorateTask(after) : res.response });
@@ -877,7 +815,7 @@ export function registerProjectTools(server, subject) {
         try {
           const body = planItemBody(it);
           if (!Object.keys(body).length) { results.push({ type: 'task', id: it.id, ok: false, error: 'no fields to update' }); failed++; continue; }
-          await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(it.id)}`, body);
+          await acceloPut(token, `/tasks/${encodeURIComponent(it.id)}`, body);
           results.push({ type: 'task', id: it.id, ok: true });
           applied++;
         } catch (e) {
@@ -942,7 +880,7 @@ export function registerProjectTools(server, subject) {
           title_change: newTitle ? { from: current.title, to: newTitle } : undefined,
         });
       }
-      if (newTitle) await acceloWrite(token, 'PUT', `/tasks/${encodeURIComponent(id)}`, { title: newTitle });
+      if (newTitle) await acceloPut(token, `/tasks/${encodeURIComponent(id)}`, { title: newTitle });
       const result = await runProgression(token, id, CANCEL_PROGRESSION_ID);
       const after = await getTask(token, id);
       return ok({ status: 'cancelled', via: result.path, task: after ? decorateTask(after) : null });

@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
 import { fetchWindow } from './pagination.js';
+import { acceloGet } from './accelo.js';
 
 // Issues module for the Accelo MCP: issue (ticket) records, profile values
 // (custom fields), and scoped activity lists.
@@ -41,27 +41,6 @@ const AGAINST_TYPES = ['company', 'affiliation', 'job', 'issue', 'prospect', 'co
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
-}
-
-async function acceloGet(token, pathname, query) {
-  const url = new URL(config.acceloBaseUrl + pathname);
-  if (query) {
-    for (const [k, v] of Object.entries(query)) {
-      if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
-    }
-  }
-  const res = await fetch(url, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
-    const msg = (json && json.meta && json.meta.message) || text;
-    log('ERROR GET', pathname, res.status, '-', msg);
-    throw new Error(`Accelo API GET ${pathname} failed: ${res.status} ${msg}`);
-  }
-  return json;
 }
 
 // Compose an Accelo _filters expression from structured params + an optional
@@ -141,7 +120,7 @@ export function registerIssueTools(server, subject) {
       search: z.string().max(200).optional().describe('Free-text search (_search) across the issue title. Used sparingly at this firm.'),
       filters: z.string().max(500).optional().describe('ADVANCED: raw Accelo _filters expression forwarded verbatim, e.g. "standing(active),date_created_after(1490140800)". BYPASSES the structured filters above. Max 500 chars.'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50, max 100).'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0).'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number (default 0).'),
     },
     async (args) => {
       const token = await getValidAcceloToken(subject);
@@ -212,7 +191,7 @@ export function registerIssueTools(server, subject) {
     {
       issue_id: z.string().describe('The Accelo issue ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50)'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number (default 0)'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number (default 0)'),
     },
     async ({ issue_id, limit, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
