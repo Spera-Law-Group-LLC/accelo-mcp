@@ -87,6 +87,7 @@ const READ_TOOLS = new Set([
   'list_project_activities',
   'search_companies',
   'get_company',
+  'get_company_profile_values',
   'get_matter_contacts',
   'list_activity_attachments',
   'list_matter_attachments',
