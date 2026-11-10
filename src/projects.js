@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
+import { fetchWindow } from './pagination.js';
 
 // Project-planning module for the Accelo MCP.
 //
@@ -168,7 +169,9 @@ async function acceloGet(token, pathname, query) {
   if (!res.ok) {
     const msg = (json && json.meta && json.meta.message) || text;
     log('ERROR GET', pathname, res.status, '-', msg);
-    throw new Error(`Accelo API GET ${pathname} failed: ${res.status} ${msg}`);
+    const error = new Error(`Accelo API GET ${pathname} failed: ${res.status} ${msg}`);
+    error.status = res.status;
+    throw error;
   }
   return json;
 }
@@ -506,41 +509,25 @@ export function registerProjectTools(server, subject) {
 
       // Accelo's company filter expression must be verified against the live
       // API before relying on it; returned company references are checked below.
-      async function fetchJobs(upstreamPage) {
+      let mismatchCount = 0;
+      let total;
+      async function fetchJobs(upstreamPage, size) {
         const json = await acceloGet(token, '/jobs', {
           _fields: JOB_FIELDS,
           _filters: filters.join(','),
-          _limit: limit + 1,
+          _limit: size,
           _page: upstreamPage,
         });
         const rows = Array.isArray(json.response) ? json.response : [];
-        return {
-          rows,
-          mismatchCount: companyMismatchCount(rows, company_id),
-          total: json.meta?.total ?? json.total,
-        };
+        mismatchCount = companyMismatchCount(rows, company_id);
+        if (total == null) total = json.meta?.total ?? json.total;
+        return mismatchCount > 0 ? [] : rows;
       }
 
-      const size = limit + 1;
-      const start = page * limit;
-      const upstreamPage = Math.floor(start / size);
-      const offset = start % size;
-      const first = await fetchJobs(upstreamPage);
-      if (first.mismatchCount > 0) {
-        return ok({ status: 'filter_not_applied', mismatch_count: first.mismatchCount });
+      const window = await fetchWindow(fetchJobs, limit, page);
+      if (mismatchCount > 0) {
+        return ok({ status: 'filter_not_applied', mismatch_count: mismatchCount });
       }
-      let rows = first.rows;
-      let total = first.total;
-      if (offset > 0 && rows.length === size) {
-        const next = await fetchJobs(upstreamPage + 1);
-        if (next.mismatchCount > 0) {
-          return ok({ status: 'filter_not_applied', mismatch_count: next.mismatchCount });
-        }
-        rows = rows.concat(next.rows);
-        if (total == null) total = next.total;
-      }
-
-      const window = rows.slice(offset, offset + size);
       const jobs = window.slice(0, limit).map((job) => ({
         id: job.id,
         title: job.title,
@@ -572,7 +559,7 @@ export function registerProjectTools(server, subject) {
       try {
         json = await acceloGet(token, `/jobs/${encodeURIComponent(job_id)}`, { _fields: JOB_FIELDS });
       } catch (error) {
-        if (error.message?.includes(' 404')) return ok({ status: 'not_found', object_type: 'job' });
+        if (error.status === 400 || error.status === 404) return ok({ status: 'not_found', object_type: 'job' });
         throw error;
       }
       const job = Array.isArray(json.response) ? json.response[0] : json.response;

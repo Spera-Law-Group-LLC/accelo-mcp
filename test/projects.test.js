@@ -189,6 +189,38 @@ test('list_jobs rejects rows when Accelo ignores the company filter', async (t) 
   assert.equal(Object.hasOwn(result, 'jobs'), false);
 });
 
+test('list_jobs rejects company mismatches on the lookahead upstream page', async (t) => {
+  const requests = mockJobReads(t, (url) => ({
+    response: url.searchParams.get('_page') === '0' ? companyJobs(100) : companyJobs(1, '999'),
+  }));
+  const result = await callTool('list_jobs', { company_id: '321', limit: 100 });
+
+  assert.deepEqual(result, { status: 'filter_not_applied', mismatch_count: 1 });
+  assert.deepEqual(requests.map((url) => url.searchParams.get('_page')), ['0', '1']);
+});
+
+test('list_jobs preserves standing filters and total metadata across upstream pages', async (t) => {
+  const rows = companyJobs(150);
+  const requests = mockJobReads(t, (url) => {
+    assert.equal(url.searchParams.get('_filters'),
+      'against_type(company),against_id(321),standing(active|paused)');
+    assert.equal(url.searchParams.get('_limit'), '100');
+    const page = Number(url.searchParams.get('_page'));
+    return {
+      response: rows.slice(page * 100, (page + 1) * 100),
+      ...(page === 1 ? { meta: { total: rows.length } } : {}),
+    };
+  });
+  const result = await callTool('list_jobs', {
+    company_id: '321', standing: ['active', 'paused'], limit: 37, page: 2,
+  });
+
+  assert.deepEqual(result.jobs.map((job) => job.id), rows.slice(74, 111).map((job) => job.id));
+  assert.equal(result.has_more, true);
+  assert.equal(result.total, 150);
+  assert.deepEqual(requests.map((url) => url.searchParams.get('_page')), ['0', '1']);
+});
+
 test('list_jobs paginates without gaps and preserves Accelo standings', async (t) => {
   const rows = companyJobs(5);
   const requests = mockJobReads(t, (url) => {
@@ -236,7 +268,7 @@ test('get_job returns typed not_found only for HTTP 400 and 404', async (t) => {
     await t.test(`HTTP ${status}`, async (t) => {
       const requests = mockJobReads(t, (url) => {
         assert.equal(url.pathname, '/api/v0/jobs/321');
-        return Response.json({ meta: { message: 'Synthetic upstream error' } }, { status });
+        return Response.json({ meta: { message: 'Synthetic upstream error mentioning 400 and 404' } }, { status });
       });
       if (status === 400 || status === 404) {
         assert.deepEqual(await callTool('get_job', { job_id: '321' }),
