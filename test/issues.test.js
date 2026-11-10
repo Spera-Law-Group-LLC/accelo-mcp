@@ -50,7 +50,7 @@ function mockAccelo(t, rows, { rejectOrder = false } = {}) {
     if (rejectOrder && query.get('_filters').includes('order_by_desc')) {
       return Response.json({ meta: { message: 'Unsupported order filter' } }, { status: 400 });
     }
-    const limit = Number(query.get('_limit'));
+    const limit = Math.min(100, Number(query.get('_limit')));
     const page = Number(query.get('_page'));
     return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
   });
@@ -80,8 +80,8 @@ test('list_issue_activities retrieves >100 rows without gaps or duplicates on bo
         received.push(...result.activities);
       }
       assert.deepEqual(received, rows);
-      assert.ok(requests.every((url) => url.searchParams.get('_limit') === '101'));
-      const pages = ['0', '0', '1', '1', '2', '2', '3'];
+      assert.ok(requests.every((url) => url.searchParams.get('_limit') === '100'));
+      const pages = ['0', '1', '1', '2', '2', '3', '3'];
       assert.deepEqual(requests.map((url) => url.searchParams.get('_page')),
         rejectOrder ? pages.flatMap((page) => [page, page]) : pages);
       for (let index = 0; index < requests.length; index++) {
@@ -101,7 +101,26 @@ test('omitting page and limit returns the first 50 activities with an explicit e
   assert.deepEqual(result, { activities: rows, has_more: false });
   assert.equal(requests.length, 1);
   assert.equal(requests[0].searchParams.get('_page'), '0');
-  assert.equal(requests[0].searchParams.get('_limit'), '51');
+  assert.equal(requests[0].searchParams.get('_limit'), '100');
+});
+
+test('issue activities page 250 rows under the Accelo cap at limits 100 and 37', async (t) => {
+  for (const limit of [100, 37]) {
+    for (const rejectOrder of [false, true]) {
+      await t.test(`limit=${limit}, rejectOrder=${rejectOrder}`, async (t) => {
+        const rows = activities(250);
+        mockAccelo(t, rows, { rejectOrder });
+        const received = [];
+        for (let page = 0; page <= Math.ceil(rows.length / limit); page++) {
+          const result = await call({ issue_id: '123', limit, page });
+          assert.deepEqual(result.activities, rows.slice(page * limit, (page + 1) * limit));
+          assert.equal(result.has_more, (page + 1) * limit < rows.length);
+          received.push(...result.activities);
+        }
+        assert.deepEqual(received, rows);
+      });
+    }
+  }
 });
 
 test('lookahead handles empty, exact, partial, beyond-end, and realigned windows', async (t) => {

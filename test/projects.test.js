@@ -46,7 +46,7 @@ function mockAccelo(t, sources, { milestones = [], rejectOrder = false, failMile
     const url = new URL(input);
     requests.push(url);
     if (url.pathname.endsWith('/jobs/123/milestones')) {
-      const limit = Number(url.searchParams.get('_limit'));
+      const limit = Math.min(100, Number(url.searchParams.get('_limit')));
       const page = Number(url.searchParams.get('_page'));
       assert.ok(url.searchParams.has('_page'));
       return Response.json({ response: milestones.slice(page * limit, (page + 1) * limit) });
@@ -65,7 +65,7 @@ function mockAccelo(t, sources, { milestones = [], rejectOrder = false, failMile
       return Response.json({ meta: { message: 'Unsupported order filter' } }, { status: 400 });
     }
     const rows = sources[`${type}:${id}`] || [];
-    const limit = Number(query.get('_limit'));
+    const limit = Math.min(100, Number(query.get('_limit')));
     const page = Number(query.get('_page'));
     assert.ok(query.has('_page'));
     return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
@@ -194,7 +194,7 @@ test('list_jobs paginates without gaps and preserves Accelo standings', async (t
   const requests = mockJobReads(t, (url) => {
     assert.equal(url.pathname, '/api/v0/jobs');
     assert.equal(url.searchParams.get('_filters'), 'against_type(company),against_id(321)');
-    const limit = Number(url.searchParams.get('_limit'));
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
     const page = Number(url.searchParams.get('_page'));
     return { response: rows.slice(page * limit, (page + 1) * limit), meta: { total: rows.length } };
   });
@@ -213,7 +213,7 @@ test('list_jobs paginates without gaps and preserves Accelo standings', async (t
     ['active', 'inactive', 'paused', 'closed', 'complete']);
   assert.notEqual(second.jobs[1].standing, 'active');
   assert.equal(first.total, 5);
-  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '3'));
+  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '100'));
   assert.ok(requests.every((url) => url.searchParams.has('_page')));
   assert.equal(first.jobs[0].url, 'https://test.accelo.com/?action=view_job&id=1');
 });
@@ -231,16 +231,54 @@ test('get_job returns a typed not_found for an ID that is not a job', async (t) 
   assert.deepEqual(requests.map((url) => url.pathname), ['/api/v0/jobs/321']);
 });
 
-test('get_job returns a typed not_found when Accelo responds with HTTP 404', async (t) => {
-  const requests = mockJobReads(t, async (url) => {
-    assert.equal(url.pathname, '/api/v0/jobs/321');
-    return new Response(JSON.stringify({ meta: { message: 'Not found' } }), { status: 404 });
-  });
+test('get_job returns typed not_found only for HTTP 400 and 404', async (t) => {
+  for (const status of [400, 404, 401, 403, 429, 500]) {
+    await t.test(`HTTP ${status}`, async (t) => {
+      const requests = mockJobReads(t, (url) => {
+        assert.equal(url.pathname, '/api/v0/jobs/321');
+        return Response.json({ meta: { message: 'Synthetic upstream error' } }, { status });
+      });
+      if (status === 400 || status === 404) {
+        assert.deepEqual(await callTool('get_job', { job_id: '321' }),
+          { status: 'not_found', object_type: 'job' });
+      } else {
+        await assert.rejects(callTool('get_job', { job_id: '321' }), new RegExp(` ${status} `));
+      }
+      assert.equal(requests.length, 1);
+    });
+  }
+});
 
-  const result = await callTool('get_job', { job_id: '321' });
-
-  assert.deepEqual(result, { status: 'not_found', object_type: 'job' });
-  assert.equal(requests.length, 1);
+test('job and project activity reads page 250 rows under the Accelo cap at limits 100 and 37', async (t) => {
+  for (const name of ['list_jobs', 'list_project_activities']) {
+    for (const limit of [100, 37]) {
+      await t.test(`${name}, limit=${limit}`, async (t) => {
+        const rows = name === 'list_jobs'
+          ? companyJobs(250)
+          : activities(Array.from({ length: 250 }, (_, index) => index + 1));
+        if (name === 'list_jobs') {
+          mockJobReads(t, (url) => {
+            const size = Math.min(100, Number(url.searchParams.get('_limit')));
+            const page = Number(url.searchParams.get('_page'));
+            return { response: rows.slice(page * size, (page + 1) * size) };
+          });
+        } else {
+          mockAccelo(t, { 'job:123': rows });
+        }
+        const received = [];
+        for (let page = 0; page <= Math.ceil(rows.length / limit); page++) {
+          const args = name === 'list_jobs' ? { company_id: '321' } : { job_id: '123' };
+          const result = await callTool(name, { ...args, limit, page });
+          const resultRows = result.jobs || result.activities;
+          assert.deepEqual(resultRows.map((row) => row.id),
+            rows.slice(page * limit, (page + 1) * limit).map((row) => row.id));
+          assert.equal(result.has_more, (page + 1) * limit < rows.length);
+          received.push(...resultRows.map((row) => row.id));
+        }
+        assert.deepEqual(received, rows.map((row) => row.id));
+      });
+    }
+  }
 });
 
 test('get_job and get_project_plan expose job company references', async (t) => {
