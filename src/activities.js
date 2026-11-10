@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
+import { fetchWindow } from './pagination.js';
 
 // Activities module for the Accelo MCP: read interaction history (notes, emails,
 // meetings, calls) and push notes/emails/time into Accelo, with threading,
@@ -247,17 +248,10 @@ async function listActivitiesRaw(token, filters, limit, page = 0) {
 }
 
 async function fetchActivityPage(token, filters, limit, page = 0) {
-  // _page offsets depend on _limit. Align the caller's limit-sized window with
-  // upstream (limit + 1)-sized pages so the lookahead row is never skipped.
-  const size = limit + 1;
-  const start = page * limit;
-  const upstreamPage = Math.floor(start / size);
-  const offset = start % size;
-  let list = await listActivitiesRaw(token, filters, size, upstreamPage);
-  if (offset > 0 && list.length === size) {
-    list = list.concat(await listActivitiesRaw(token, filters, size, upstreamPage + 1));
-  }
-  const window = list.slice(offset, offset + size);
+  const window = await fetchWindow(
+    (upstreamPage, size) => listActivitiesRaw(token, filters, size, upstreamPage),
+    limit, page
+  );
   return {
     activities: sortNewestFirst(window.slice(0, limit)).map((a) => decorateActivity(a)),
     has_more: window.length > limit,

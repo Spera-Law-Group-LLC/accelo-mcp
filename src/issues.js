@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { config } from './config.js';
 import { getValidAcceloToken } from './oauth.js';
+import { fetchWindow } from './pagination.js';
 
 // Issues module for the Accelo MCP: issue (ticket) records, profile values
 // (custom fields), and scoped activity lists.
@@ -221,8 +222,8 @@ export function registerIssueTools(server, subject) {
 
       // Try with ordering filter first (Accelo syntax varies by deployment);
       // preserve the upstream page when retrying without ordering.
-      async function fetchPage(upstreamPage) {
-        const base = { _limit: lim + 1, _page: upstreamPage, _fields: fields };
+      async function fetchPage(upstreamPage, size) {
+        const base = { _limit: size, _page: upstreamPage, _fields: fields };
         try {
           const json = await acceloGet(token, '/activities', {
             ...base, _filters: `${filters},order_by_desc(date_logged)`,
@@ -237,17 +238,7 @@ export function registerIssueTools(server, subject) {
         }
       }
 
-      // Align limit-sized caller windows with (limit + 1)-sized upstream pages
-      // so the lookahead row is not skipped on the next caller page.
-      const size = lim + 1;
-      const start = page * lim;
-      const upstreamPage = Math.floor(start / size);
-      const offset = start % size;
-      let list = await fetchPage(upstreamPage);
-      if (offset > 0 && list.length === size) {
-        list = list.concat(await fetchPage(upstreamPage + 1));
-      }
-      const window = list.slice(offset, offset + size);
+      const window = await fetchWindow(fetchPage, lim, page);
       const activities = window.slice(0, lim);
 
       // Guarantee newest-first regardless of server-side ordering support.

@@ -55,8 +55,8 @@ function mockAccelo(t, rows, { rejectOrder = false } = {}) {
     if (rejectOrder && query.get('_filters').includes('order_by_desc')) {
       return Response.json({ meta: { message: 'Unsupported order filter' } }, { status: 400 });
     }
-    // Model Accelo pages using the requested size, not the caller's limit.
-    const limit = Number(query.get('_limit'));
+    // Accelo caps the effective page size at 100.
+    const limit = Math.min(100, Number(query.get('_limit')));
     const page = Number(query.get('_page'));
     assert.ok(query.has('_page'));
     return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
@@ -105,7 +105,7 @@ test('list_activities retrieves a >100-row history without gaps or duplicates', 
     received.push(...result.activities.map((row) => row.id));
   }
   assert.deepEqual(received, rows.map((row) => row.id));
-  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '101'));
+  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '100'));
   assert.ok(requests.every((url) =>
     url.searchParams.get('_filters') === 'against(job(123)),medium(email),order_by_desc(date_logged)'));
 });
@@ -117,7 +117,7 @@ test('list_activities defaults to page zero and limit 50, with an explicit end s
   assert.equal(result.has_more, false);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].searchParams.get('_page'), '0');
-  assert.equal(requests[0].searchParams.get('_limit'), '51');
+  assert.equal(requests[0].searchParams.get('_limit'), '100');
 });
 
 test('lookahead distinguishes exact, partial, empty, and beyond-end pages', async (t) => {
@@ -148,8 +148,8 @@ test('order-filter fallback preserves _page and _limit on every upstream page', 
   });
   assert.deepEqual(result.activities.map((row) => row.id), rows.slice(200, 300).map((row) => row.id));
   assert.equal(result.has_more, true);
-  assert.deepEqual(requests.map((url) => url.searchParams.get('_page')), ['1', '1', '2', '2']);
-  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '101'));
+  assert.deepEqual(requests.map((url) => url.searchParams.get('_page')), ['2', '2', '3', '3']);
+  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '100'));
   for (let index = 0; index < requests.length; index += 2) {
     assert.ok(requests[index].searchParams.get('_filters').includes('order_by_desc'));
     assert.equal(requests[index + 1].searchParams.get('_filters'), 'against(job(123)),medium(email)');
@@ -169,7 +169,7 @@ test('get_activity_thread defaults to 100 and retrieves the remaining thread pag
   }
   assert.deepEqual(received, rows.map((row) => row.id));
   const listRequests = requests.filter((url) => url.pathname.endsWith('/activities'));
-  assert.ok(listRequests.every((url) => url.searchParams.get('_limit') === '101'));
+  assert.ok(listRequests.every((url) => url.searchParams.get('_limit') === '100'));
   assert.ok(listRequests.every((url) => url.searchParams.get('_filters') === 'thread(7),order_by_desc(date_logged)'));
   assert.equal(listRequests[0].searchParams.get('_page'), '0');
 });
@@ -180,8 +180,33 @@ test('get_activity_thread honors a smaller caller limit and uses the order fallb
   assert.deepEqual(result.activities.map((row) => row.id), ['3', '2']);
   assert.equal(result.has_more, true);
   const listRequests = requests.filter((url) => url.pathname.endsWith('/activities'));
-  assert.deepEqual(listRequests.map((url) => url.searchParams.get('_page')), ['0', '0', '1', '1']);
-  assert.ok(listRequests.every((url) => url.searchParams.get('_limit') === '3'));
+  assert.deepEqual(listRequests.map((url) => url.searchParams.get('_page')), ['0', '0']);
+  assert.ok(listRequests.every((url) => url.searchParams.get('_limit') === '100'));
+});
+
+test('activity reads page 250 rows under the Accelo cap at limits 100 and 37', async (t) => {
+  for (const name of ['list_activities', 'get_activity_thread']) {
+    for (const limit of [100, 37]) {
+      for (const rejectOrder of [false, true]) {
+        await t.test(`${name}, limit=${limit}, rejectOrder=${rejectOrder}`, async (t) => {
+          const rows = activities(250);
+          mockAccelo(t, rows, { rejectOrder });
+          const received = [];
+          for (let page = 0; page <= Math.ceil(rows.length / limit); page++) {
+            const args = name === 'list_activities'
+              ? { against_type: 'job', against_id: '123' }
+              : { id: '1' };
+            const result = await call(name, { ...args, limit, page });
+            assert.deepEqual(result.activities.map((row) => row.id),
+              rows.slice(page * limit, (page + 1) * limit).map((row) => row.id));
+            assert.equal(result.has_more, (page + 1) * limit < rows.length);
+            received.push(...result.activities.map((row) => row.id));
+          }
+          assert.deepEqual(received, rows.map((row) => row.id));
+        });
+      }
+    }
+  }
 });
 
 test('activity read schemas reject invalid pages and explain how to follow has_more', () => {
