@@ -32,3 +32,13 @@ test('read-only registration withholds fabricated tools while full scope passes 
   full.tool('future_unclassified_tool');
   assert.deepEqual(registered, ['list_activities', 'future_unclassified_tool']);
 });
+
+test('read-only registration includes job discovery and detail tools', () => {
+  const registered = [];
+  const readOnly = scopedServer({ tool: (name) => registered.push(name) }, 'read_only');
+
+  readOnly.tool('list_jobs');
+  readOnly.tool('get_job');
+
+  assert.deepEqual(registered, ['list_jobs', 'get_job']);
+});

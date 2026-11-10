@@ -58,7 +58,11 @@ function mockAccelo(t, rows, { rejectOrder = false } = {}) {
 }
 
 async function call(args) {
-  const tool = tools.get('list_issue_activities');
+  return callTool('list_issue_activities', args);
+}
+
+async function callTool(name, args) {
+  const tool = tools.get(name);
   for (const [key, schema] of Object.entries(tool.schema)) schema.parse(args[key]);
   return JSON.parse((await tool.handler(args)).content[0].text);
 }
@@ -141,4 +145,59 @@ test('issue activity schema validates pages and documents how to continue', () =
   assert.equal(tool.schema.page.safeParse(0).success, true);
   assert.match(tool.description, /has_more/);
   assert.match(tool.description, /page \+ 1/);
+});
+
+function mockIssueReads(t, response) {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    assert.ok(url.pathname.endsWith('/issues') || url.pathname.includes('/profiles/values'));
+    return Response.json({ response });
+  });
+  return requests;
+}
+
+test('list_issues rejects records outside the structured company scope', async (t) => {
+  mockIssueReads(t, [{
+    id: '1',
+    against_type: 'company',
+    against_id: '999',
+    date_created: '1700000000',
+  }]);
+
+  const result = await callTool('list_issues', {
+    against_type: 'company',
+    against_id: '321',
+  });
+
+  assert.deepEqual(result, { status: 'filter_not_applied', mismatch_count: 1 });
+  assert.equal(Object.hasOwn(result, 'issues'), false);
+});
+
+test('list_issues labels raw-filter results as unverified', async (t) => {
+  mockIssueReads(t, [{ id: '1', against_type: 'company', against_id: '999' }]);
+
+  const result = await callTool('list_issues', { filters: 'status(open)' });
+
+  assert.deepEqual(result, {
+    issues: [{ id: '1', against_type: 'company', against_id: '999' }],
+    scope_verified: false,
+  });
+});
+
+test('issue profile values distinguish definition and value IDs and allow field selection', async (t) => {
+  const requests = mockIssueReads(t, [
+    { id: '9001', field_id: '62', field_name: 'Project Folder', field_type: 'hyperlink', value: 'https://drive.example/one' },
+    { id: '9002', field_id: '63', field_name: 'Summary', field_type: 'text', value: 'summary' },
+  ]);
+
+  const values = await callTool('get_issue_profile_values', { issue_id: '321', field_id: '62' });
+
+  assert.equal(values.length, 1);
+  assert.equal(values[0].field_id, '62');
+  assert.equal(values[0].value_id, '9001');
+  assert.equal(values[0].id, '9001');
+  assert.notEqual(values[0].field_id, values[0].value_id);
+  assert.equal(requests[0].searchParams.get('_fields'), 'id,value,field_id,field_name,field_type');
 });

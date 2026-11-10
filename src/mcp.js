@@ -76,6 +76,8 @@ const READ_TOOLS = new Set([
   'get_quote',
   'get_deal',
   'get_project_plan',
+  'list_jobs',
+  'get_job',
   'list_tasks',
   'get_task',
   'list_task_progressions',
