@@ -210,9 +210,11 @@ test('activity reads page 250 rows under the Accelo cap at limits 100 and 37', a
 });
 
 test('activity read schemas reject invalid pages and explain how to follow has_more', () => {
-  for (const name of ['list_activities', 'get_activity_thread']) {
+  for (const name of [
+    'list_activities', 'get_activity_thread', 'list_activity_attachments', 'list_matter_attachments',
+  ]) {
     const tool = tools.get(name);
-    for (const page of [-1, 0.5, '1']) {
+    for (const page of [-1, 0.5, '1', 10001]) {
       assert.equal(tool.schema.page.safeParse(page).success, false);
     }
     assert.equal(tool.schema.page.safeParse(undefined).success, true);
@@ -220,6 +222,81 @@ test('activity read schemas reject invalid pages and explain how to follow has_m
     assert.match(tool.description, /has_more/);
     assert.match(tool.description, /page \+ 1/);
   }
+});
+
+test('list_activity_attachments uses the production activity filter and maps metadata', async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    assert.equal(url.pathname, '/api/v0/resources');
+    assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    assert.equal(limit, 100);
+    return Response.json({
+      response: [{
+        id: 'resource-1', title: 'Engagement', filename: 'engagement.pdf',
+        mime_type: 'application/pdf', filesize: '1200', date_created: '1700000000', activity_id: '77',
+      }],
+    });
+  });
+  const result = await call('list_activity_attachments', { activity_id: '77' });
+  assert.equal(result.attachments[0].title, 'Engagement');
+  assert.equal(result.attachments[0].filename, 'engagement.pdf');
+  assert.equal(result.attachments[0].mimetype, 'application/pdf');
+  assert.equal(result.attachments[0].activity_id, '77');
+  assert.equal(result.has_more, false);
+  assert.equal(requests.length, 1);
+});
+
+test('list_matter_attachments tags files and reports the activity fan-out cap', async (t) => {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    if (url.pathname === '/api/v0/activities') {
+      return Response.json({
+        response: [{
+          id: '77', subject: 'Client call', date_logged: '1700000000',
+          date_created: '1700000000', against_type: 'job', against_id: '20',
+        }].slice(0, limit),
+      });
+    }
+    assert.equal(url.pathname, '/api/v0/resources');
+    assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
+    return Response.json({ response: [{
+      id: 'resource-1', title: 'Engagement', filename: 'engagement.pdf', mimetype: 'application/pdf',
+    }] });
+  });
+  const result = await call('list_matter_attachments', {
+    against_type: 'job', against_id: '20', limit: 10,
+  });
+  assert.equal(result.attachments[0].activity_id, '77');
+  assert.equal(result.attachments[0].activity_subject, 'Client call');
+  assert.ok(result.attachments[0].date_logged);
+  assert.equal(result.capped, false);
+  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '100'));
+
+  const manyActivities = Array.from({ length: 101 }, (_, index) => ({
+    id: String(index + 1), subject: 'Synthetic activity', date_logged: '1700000000',
+  }));
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    if (url.pathname === '/api/v0/activities') {
+      const page = Number(url.searchParams.get('_page'));
+      return Response.json({ response: manyActivities.slice(page * limit, (page + 1) * limit) });
+    }
+    return Response.json({ response: [] });
+  });
+  const capped = await call('list_matter_attachments', {
+    against_type: 'job', against_id: '20', limit: 10,
+  });
+  assert.equal(capped.capped, true);
+  assert.equal(capped.activities_gathered, 100);
+  assert.equal(capped.has_more, true);
 });
 
 test('create_activity inherits the parent object for previews and confirmed writes', async (t) => {

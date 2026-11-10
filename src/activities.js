@@ -198,6 +198,7 @@ async function listActivitiesRaw(token, filters, limit, page = 0) {
     const json = await acceloGet(token, '/activities', { ...base, _filters: ordered });
     return Array.isArray(json.response) ? json.response : [];
   } catch (e) {
+    if (e.status !== 400) throw e;
     // Order-filter syntax not accepted on this deployment -- retry plain.
     const q = { ...base };
     if (filters) q._filters = filters;

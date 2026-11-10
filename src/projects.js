@@ -166,6 +166,9 @@ async function runProgression(token, taskId, progressionId) {
   for (const p of candidates) {
     const r = await acceloTryPost(token, p, {});
     if (r.ok) return { path: p, response: r.json };
+    if (r.status !== 400) {
+      throw new Error(`Progression ${progressionId} on task ${taskId} failed: ${r.status} ${r.message}`);
+    }
     errors.push(`${p} -> ${r.status} ${r.message}`);
   }
   throw new Error(`Progression ${progressionId} on task ${taskId} failed. Tried: ${errors.join(' | ')}`);
@@ -365,6 +368,7 @@ async function queryActivitiesFor(token, againstType, againstId, limit, page) {
     });
     return Array.isArray(json.response) ? json.response : [];
   } catch (e) {
+    if (e.status !== 400) throw e;
     // Order filter rejected on this deployment -- retry without.
     log('order filter rejected for', againstType, againstId, '- retrying:', e.message);
     const json = await acceloGet(token, '/activities', {

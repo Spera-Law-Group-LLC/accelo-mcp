@@ -145,6 +145,7 @@ export function registerIssueTools(server, subject) {
         const json = await acceloGet(token, '/issues', { ...baseQuery, _filters: orderExpr });
         list = Array.isArray(json.response) ? json.response : [];
       } catch (e) {
+        if (e.status !== 400) throw e;
         log('order filter rejected, retrying without:', e.message);
         const json = await acceloGet(token, '/issues', {
           ...baseQuery,
@@ -209,6 +210,7 @@ export function registerIssueTools(server, subject) {
           });
           return Array.isArray(json.response) ? json.response : [];
         } catch (e) {
+          if (e.status !== 400) throw e;
           log('order filter rejected, retrying without:', e.message);
           const json = await acceloGet(token, '/activities', {
             ...base, _filters: filters,

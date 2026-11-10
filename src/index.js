@@ -112,6 +112,7 @@ app.post('/register', registerLimiter, (req, res) => {
     log('[register] level=warn rejected reason=invalid_redirect_uri', originFields);
     return res.status(400).json({ error: 'invalid_redirect_uri' });
   }
+  // Stored redirect URIs may contain HTML metacharacters; future views must escape the full URI.
   const client_id = rand(16);
   const client_secret = rand(24);
   db.prepare('INSERT INTO clients (client_id, client_secret, redirect_uris, created_at, scope) VALUES (?,?,?,?,?)')
