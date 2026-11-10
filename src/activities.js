@@ -476,7 +476,7 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'list_matter_collections',
-    'List metadata for files uploaded directly to a job or issue. Returns resource rows tagged with collection ID and title. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request page + 1 with the same limit. Read-only.',
+    'List metadata for files uploaded directly to a job or issue. Returns resource rows tagged with collection ID and title, or source "owner" when using the owner-filter fallback. Unsupported endpoints return a typed error naming attempted paths and statuses. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request page + 1 with the same limit. Read-only.',
     {
       against_type: z.enum(['job', 'issue']).describe('Matter type'),
       against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
@@ -488,58 +488,106 @@ export function registerActivityTools(server, subject) {
       const collectionCap = 100;
       const attachmentCap = 1000;
 
-      // The collections filter shape is a candidate and must be verified live; keep any unsupported/4xx response visible.
-      const collectionWindow = await fetchWindow(async (upstreamPage, size) => {
-        const json = await acceloGet(token, '/collections', {
-          _filters: `against_type(${against_type}),against_id(${against_id})`,
-          _fields: 'id,title',
-          _limit: size,
-          _page: upstreamPage,
-        });
-        if (!Array.isArray(json.response)) throw new Error('Accelo matter collections returned an invalid response.');
-        return json.response;
-      }, collectionCap, 0);
-      const collections = collectionWindow.slice(0, collectionCap);
-      const attachments = [];
+      const attempts = [];
+      const fetchMetadata = async (path, query) => {
+        const attemptedPath = query._filters ? `${path}?_filters=${query._filters}` : path;
+        try {
+          const json = await acceloGet(token, path, query);
+          attempts.push({ path: attemptedPath, status: 200 });
+          return json;
+        } catch (error) {
+          attempts.push({ path: attemptedPath, status: error.status ?? null });
+          throw error;
+        }
+      };
+      let collectionWindow = [];
+      let attachments = [];
       let resourceCapped = false;
       let collectionsProcessed = 0;
+      let source;
 
-      for (const collection of collections) {
-        collectionsProcessed += 1;
-        const collectionId = collection.id;
-        if (collectionId == null) throw new Error('Accelo collection response is missing an ID.');
-        const resourceWindow = await fetchWindow(async (upstreamPage, size) => {
-          const json = await acceloGet(token, '/resources', {
-            _filters: `collection_id(${collectionId})`,
-            _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created',
+      try {
+        collectionWindow = await fetchWindow(async (upstreamPage, size) => {
+          const json = await fetchMetadata(`/${against_type}s/${encodeURIComponent(against_id)}/collections`, {
+            _fields: 'id,title',
             _limit: size,
             _page: upstreamPage,
           });
-          if (!Array.isArray(json.response)) throw new Error('Accelo collection resources returned an invalid response.');
+          if (!Array.isArray(json.response)) throw new Error('Accelo matter collections returned an invalid response.');
           return json.response;
-        }, Math.min(100, attachmentCap - attachments.length), 0);
-        const collectionResources = resourceWindow.slice(0, 100);
-        if (resourceWindow.length > collectionResources.length) resourceCapped = true;
-        for (const resource of collectionResources) {
+        }, collectionCap, 0);
+        const collections = collectionWindow.slice(0, collectionCap);
+        for (const collection of collections) {
+          collectionsProcessed += 1;
+          const collectionId = collection.id;
+          if (collectionId == null) throw new Error('Accelo collection response is missing an ID.');
+          const resourceWindow = await fetchWindow(async (upstreamPage, size) => {
+            const json = await fetchMetadata('/resources', {
+              _filters: `collection_id(${collectionId})`,
+              _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created',
+              _limit: size,
+              _page: upstreamPage,
+            });
+            if (!Array.isArray(json.response)) throw new Error('Accelo collection resources returned an invalid response.');
+            return json.response;
+          }, Math.min(100, attachmentCap - attachments.length), 0);
+          const collectionResources = resourceWindow.slice(0, 100);
+          if (resourceWindow.length > collectionResources.length) resourceCapped = true;
+          for (const resource of collectionResources) {
+            if (attachments.length >= attachmentCap) {
+              resourceCapped = true;
+              break;
+            }
+            attachments.push({
+              id: resource.id,
+              title: resource.title,
+              filename: resource.filename,
+              mimetype: resource.mimetype ?? resource.mime_type,
+              filesize: resource.filesize,
+              date_created: resource.date_created,
+              collection_id: String(collectionId),
+              collection_title: collection.title ?? null,
+            });
+          }
           if (attachments.length >= attachmentCap) {
-            resourceCapped = true;
+            resourceCapped ||= resourceWindow.length > collectionResources.length ||
+              collectionsProcessed < collections.length || collectionWindow.length > collectionCap;
             break;
           }
-          attachments.push({
+        }
+      } catch (error) {
+        if (error.status !== 400 && error.status !== 404) throw error;
+        try {
+          const window = await fetchWindow(async (upstreamPage, size) => {
+            const json = await fetchMetadata('/resources', {
+              _filters: `owner_type(${against_type}),owner_id(${against_id})`,
+              _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created',
+              _limit: size,
+              _page: upstreamPage,
+            });
+            if (!Array.isArray(json.response)) throw new Error('Accelo owner resources returned an invalid response.');
+            return json.response;
+          }, attachmentCap, 0);
+          attachments = window.slice(0, attachmentCap).map((resource) => ({
             id: resource.id,
             title: resource.title,
             filename: resource.filename,
             mimetype: resource.mimetype ?? resource.mime_type,
             filesize: resource.filesize,
             date_created: resource.date_created,
-            collection_id: String(collectionId),
-            collection_title: collection.title ?? null,
+            source: 'owner',
+          }));
+          resourceCapped = window.length > attachmentCap;
+          collectionWindow = [];
+          collectionsProcessed = 0;
+          source = 'owner';
+        } catch (ownerError) {
+          return ok({
+            status: 'error',
+            error: 'collections_unavailable',
+            message: `Matter file lookup failed: ${attempts.map((attempt) => `${attempt.path}: ${attempt.status}`).join('; ')}. ${ownerError.message}`,
+            attempts,
           });
-        }
-        if (attachments.length >= attachmentCap) {
-          resourceCapped ||= resourceWindow.length > collectionResources.length ||
-            collectionsProcessed < collections.length || collectionWindow.length > collectionCap;
-          break;
         }
       }
 
@@ -548,6 +596,7 @@ export function registerActivityTools(server, subject) {
       const start = page * limit;
       return ok({
         attachments: attachments.slice(start, start + limit),
+        ...(source ? { source } : {}),
         page,
         limit,
         has_more: attachments.length > start + limit || capped,

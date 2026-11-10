@@ -307,8 +307,7 @@ test('list_matter_collections pages collections and tags resource metadata', asy
     requests.push(url);
     const limit = Math.min(100, Number(url.searchParams.get('_limit')));
     assert.equal(limit, 100);
-    if (url.pathname === '/api/v0/collections') {
-      assert.equal(url.searchParams.get('_filters'), 'against_type(job),against_id(20)');
+    if (url.pathname === '/api/v0/jobs/20/collections') {
       return Response.json({ response: [{ id: 'collection-7', title: 'Matter Files' }].slice(0, limit) });
     }
     assert.equal(url.pathname, '/api/v0/resources');
@@ -337,12 +336,90 @@ test('list_matter_collections pages collections and tags resource metadata', asy
   assert.equal(requests.length, 2);
 });
 
-test('list_matter_collections surfaces an unsupported collections endpoint', async (t) => {
-  t.mock.method(globalThis, 'fetch', async () =>
-    Response.json({ meta: { message: 'resource endpoint was not recognized' } }, { status: 400 }));
-  await assert.rejects(call('list_matter_collections', {
-    against_type: 'issue', against_id: '20',
-  }), { status: 400 });
+for (const status of [400, 404]) {
+  test(`list_matter_collections uses owner resources after nested endpoint returns ${status}`, async (t) => {
+    const requests = [];
+    t.mock.method(globalThis, 'fetch', async (input) => {
+      const url = new URL(input);
+      requests.push(url);
+      if (url.pathname === '/api/v0/issues/20/collections') {
+        return Response.json({ meta: { message: 'unsupported' } }, { status });
+      }
+      assert.equal(url.pathname, '/api/v0/resources');
+      assert.equal(url.searchParams.get('_filters'), 'owner_type(issue),owner_id(20)');
+      const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+      const page = Number(url.searchParams.get('_page'));
+      const rows = Array.from({ length: 150 }, (_, index) => ({
+        id: String(index + 1), filename: 'file.pdf', mime_type: 'application/pdf', body: 'must not be returned',
+      }));
+      return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+    });
+    const result = await call('list_matter_collections', {
+      against_type: 'issue', against_id: '20', limit: 37, page: 2,
+    });
+    assert.equal(result.source, 'owner');
+    assert.equal(result.attachments.length, 37);
+    assert.equal(result.attachments[0].id, '75');
+    assert.equal(result.attachments[0].source, 'owner');
+    assert.equal(result.attachments[0].mimetype, 'application/pdf');
+    assert.equal(result.attachments[0].body, undefined);
+    assert.equal(result.capped, false);
+    assert.equal(result.has_more, true);
+    assert.equal(result.collections_gathered, 0);
+    assert.equal(result.attachments_gathered, 150);
+    assert.equal(requests.length, 3);
+  });
+}
+
+test('list_matter_collections returns a typed error naming both failed paths and statuses', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    const status = url.pathname.endsWith('/collections') ? 404 : 400;
+    return Response.json({ meta: { message: 'resource endpoint was not recognized' } }, { status });
+  });
+  const result = await call('list_matter_collections', { against_type: 'issue', against_id: '20' });
+  assert.equal(result.status, 'error');
+  assert.equal(result.error, 'collections_unavailable');
+  assert.deepEqual(result.attempts, [
+    { path: '/issues/20/collections', status: 404 },
+    { path: '/resources?_filters=owner_type(issue),owner_id(20)', status: 400 },
+  ]);
+  for (const { path, status } of result.attempts) {
+    assert.ok(result.message.includes(`${path}: ${status}`));
+  }
+  assert.equal(result.attachments, undefined);
+});
+
+test('list_matter_collections names failed collection resource paths and discards partial rows', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith('/collections')) {
+      return Response.json({ response: [{ id: '1' }, { id: '2' }] });
+    }
+    if (url.searchParams.get('_filters') === 'collection_id(1)') {
+      return Response.json({ response: [{ id: 'partial' }] });
+    }
+    return Response.json({ meta: { message: 'unsupported' } }, { status: 400 });
+  });
+  const result = await call('list_matter_collections', { against_type: 'job', against_id: '20' });
+  assert.equal(result.status, 'error');
+  assert.deepEqual(result.attempts, [
+    { path: '/jobs/20/collections', status: 200 },
+    { path: '/resources?_filters=collection_id(1)', status: 200 },
+    { path: '/resources?_filters=collection_id(2)', status: 400 },
+    { path: '/resources?_filters=owner_type(job),owner_id(20)', status: 400 },
+  ]);
+  assert.equal(JSON.stringify(result).includes('partial'), false);
+});
+
+test('list_matter_collections does not fall back on denied access', async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls += 1;
+    return Response.json({ meta: { message: 'denied' } }, { status: 403 });
+  });
+  await assert.rejects(call('list_matter_collections', { against_type: 'job', against_id: '20' }), { status: 403 });
+  assert.equal(calls, 1);
 });
 
 test('list_matter_collections discloses the collection fan-out cap', async (t) => {
@@ -355,7 +432,7 @@ test('list_matter_collections discloses the collection fan-out cap', async (t) =
     requests.push(url);
     const limit = Math.min(100, Number(url.searchParams.get('_limit')));
     assert.equal(limit, 100);
-    if (url.pathname === '/api/v0/collections') {
+    if (url.pathname === '/api/v0/jobs/20/collections') {
       const page = Number(url.searchParams.get('_page'));
       return Response.json({ response: collections.slice(page * limit, (page + 1) * limit) });
     }
@@ -368,7 +445,26 @@ test('list_matter_collections discloses the collection fan-out cap', async (t) =
   assert.equal(result.collections_gathered, 100);
   assert.equal(result.attachments_gathered, 0);
   assert.equal(result.has_more, true);
-  assert.equal(requests.filter((url) => url.pathname === '/api/v0/collections').length, 2);
+  assert.equal(requests.filter((url) => url.pathname === '/api/v0/jobs/20/collections').length, 2);
+});
+
+test('list_matter_collections discloses the owner resource cap', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith('/collections')) {
+      return Response.json({ meta: { message: 'unsupported' } }, { status: 400 });
+    }
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    const page = Number(url.searchParams.get('_page'));
+    const rows = Array.from({ length: 1001 }, (_, index) => ({ id: String(index + 1) }));
+    return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+  });
+  const result = await call('list_matter_collections', { against_type: 'job', against_id: '20' });
+  assert.equal(result.source, 'owner');
+  assert.equal(result.capped, true);
+  assert.equal(result.has_more, true);
+  assert.equal(result.attachments_gathered, 1000);
+  assert.equal(result.attachment_cap, 1000);
 });
 
 test('create_activity inherits the parent object for previews and confirmed writes', async (t) => {

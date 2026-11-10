@@ -48,7 +48,14 @@ export function registerCompanyTools(server, subject) {
         status: company.status,
         url: companyUrl(company.id),
       }));
-      return ok({ companies, page, limit, has_more: window.length > limit });
+      const exactMatch = companies.some((company) => company.name?.toLowerCase() === name.toLowerCase());
+      return ok({
+        companies, page, limit, has_more: window.length > limit,
+        exact_match: exactMatch,
+        ...(!exactMatch ? {
+          hint: 'The short name may be a Tradename. Check the candidates with get_company_profile_values.',
+        } : {}),
+      });
     }
   );
 
@@ -85,8 +92,36 @@ export function registerCompanyTools(server, subject) {
   );
 
   server.tool(
+    'get_company_profile_values',
+    'Get custom profile field values for a company, including Tradename. Returns field_id, value_id, field_name, field_type, and value. Read-only.',
+    {
+      company_id: z.string().regex(/^\d+$/, 'company_id must be a numeric ID').describe('Numeric Accelo company ID'),
+      field_id: z.string().regex(/^\d+$/, 'field_id must be a numeric ID').optional().describe('Return only this profile-field definition ID'),
+    },
+    async ({ company_id, field_id }) => {
+      const token = await getValidAcceloToken(subject);
+      const json = await acceloGet(token, `/companies/${encodeURIComponent(company_id)}/profiles/values`, {
+        _fields: 'id,value,field_id,field_name,field_type',
+        _limit: 100,
+      });
+      if (!Array.isArray(json.response)) throw new Error('Accelo company profile values returned an invalid response.');
+      return ok(json.response.map((row) => {
+        const valueId = row.value_id ?? row.id ?? null;
+        return {
+          id: valueId,
+          field_id: row.field_id ?? row.profile_field_id ?? row.field?.id ?? row.profile_field?.id ?? null,
+          value_id: valueId,
+          field_name: row.field_name ?? row.profile_field_name ?? row.field?.name ?? row.profile_field?.name ?? null,
+          field_type: row.field_type ?? row.profile_field_type ?? row.field?.type ?? row.profile_field?.type ?? null,
+          value: row.value,
+        };
+      }).filter((row) => field_id === undefined || String(row.field_id) === field_id));
+    }
+  );
+
+  server.tool(
     'get_matter_contacts',
-    'List contacts affiliated with a job or issue and identify the matter’s own client affiliation. Read-only.',
+    'Get the matter’s own client affiliation and a company-verified contact roster for a job or issue. Roster failures return roster_error; an unverified roster returns filter_not_applied without roster rows. The own affiliation is preserved in either case. Read-only.',
     {
       against_type: z.enum(['job', 'issue']).describe('Matter type'),
       against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
@@ -108,42 +143,77 @@ export function registerCompanyTools(server, subject) {
           has_more: false,
         });
       }
+      const fields = 'id,contact(id,firstname,surname,email),email,phone,mobile,position,company,standing';
+      const ownResponse = (await acceloGet(token, `/affiliations/${encodeURIComponent(ownAffiliationId)}`, {
+        _fields: fields,
+      })).response;
+      const ownAffiliation = Array.isArray(ownResponse) ? ownResponse[0] : ownResponse;
+      if (!ownAffiliation) throw new Error('Accelo affiliation lookup returned no record.');
       const companyId = relationId(matter.company) ?? matter.company_id ??
-        relationId(matter.affiliation?.company) ?? matter.affiliation?.company_id;
-      if (companyId == null) throw new Error('Matter affiliation has no resolvable company ID.');
-
-      // The nested affiliations route is documented in the issue but cannot be verified live here.
-      // Keep failures visible rather than treating an unsupported endpoint as an empty result.
-      const window = await fetchWindow(async (upstreamPage, size) => {
-        const json = await acceloGet(token, `/companies/${encodeURIComponent(companyId)}/affiliations`, {
-          _fields: '_ALL',
-          _limit: size,
-          _page: upstreamPage,
-        });
-        if (!Array.isArray(json.response)) throw new Error('Accelo company affiliations returned an invalid response.');
-        return json.response;
-      }, 100, 0);
-      const contacts = window.slice(0, 100).map((row) => {
+        relationId(ownAffiliation.company) ?? ownAffiliation.company_id;
+      const toContact = (row) => {
         const contact = row.contact && typeof row.contact === 'object' ? row.contact : row;
         const affiliationId = relationId(row) ?? row.affiliation_id ?? null;
         return {
           id: relationId(row.contact) ?? row.contact_id ?? contact.id ?? null,
-          name: contact.name ?? row.name ?? null,
+          contact_id: relationId(row.contact) ?? row.contact_id ?? contact.id ?? null,
+          firstname: contact.firstname ?? null,
+          surname: contact.surname ?? null,
+          name: contact.name ?? ([contact.firstname, contact.surname].filter(Boolean).join(' ') || row.name || null),
           email: contact.email ?? row.email ?? null,
           phone: contact.phone ?? row.phone ?? null,
+          mobile: row.mobile ?? contact.mobile ?? null,
           affiliation_id: affiliationId,
           position: row.position ?? contact.position ?? null,
           role: row.role ?? contact.role ?? null,
+          standing: row.standing ?? contact.standing ?? null,
           is_matter_affiliation: String(affiliationId) === String(ownAffiliationId),
         };
-      });
-      return ok({
+      };
+      const result = {
         against_type,
         against_id,
         affiliation_id: String(ownAffiliationId),
-        contacts,
-        has_more: window.length > contacts.length,
-      });
+        contacts: [toContact({ ...ownAffiliation, id: ownAffiliationId })],
+        has_more: false,
+      };
+      try {
+        if (companyId == null) throw new Error('Matter affiliation has no resolvable company ID.');
+        const fetchRoster = (filter) => fetchWindow(async (upstreamPage, size) => {
+          const json = await acceloGet(token, '/affiliations', {
+            _filters: `${filter}(${companyId})`,
+            _fields: fields,
+            _limit: size,
+            _page: upstreamPage,
+          });
+          if (!Array.isArray(json.response)) throw new Error('Accelo company affiliations returned an invalid response.');
+          const mismatchCount = json.response.filter((row) =>
+            String(relationId(row.company) ?? row.company_id) !== String(companyId)).length;
+          if (mismatchCount) {
+            throw Object.assign(new Error('Company affiliation filter was not applied.'), { mismatch_count: mismatchCount });
+          }
+          return json.response;
+        }, 100, 0);
+        let window;
+        try {
+          window = await fetchRoster('company_id');
+        } catch (error) {
+          if (error.status !== 400) throw error;
+          window = await fetchRoster('company');
+        }
+        result.contacts.push(...window.slice(0, 100)
+          .filter((row) => String(relationId(row)) !== String(ownAffiliationId))
+          .map(toContact));
+        result.has_more = window.length > 100;
+      } catch (error) {
+        if (error.mismatch_count) {
+          result.status = 'filter_not_applied';
+          result.mismatch_count = error.mismatch_count;
+        } else {
+          result.roster_error = `${error.status ?? 'error'} ${error.message}`;
+        }
+      }
+      return ok(result);
     }
   );
 }

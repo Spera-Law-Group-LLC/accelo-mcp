@@ -994,7 +994,7 @@ test('registered confidential client completes PKCE authorization, callback, red
   const listed = await mcpRequest(issued.access_token, 'tools/list');
   assert.equal(listed.status, 200);
   const listedBody = await mcpJson(listed);
-  assert.equal(listedBody.result.tools.length, 36, 'dynamically registered LibreChat clients retain all tools');
+  assert.equal(listedBody.result.tools.length, 37, 'dynamically registered LibreChat clients retain all tools');
   assert.equal((await token(request)).status, 400);
   const refreshRequest = {
     grant_type: 'refresh_token', refresh_token: issued.refresh_token,
@@ -1033,7 +1033,9 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   assert.equal(fullClient.scope, 'full');
   const fullAccess = seedAccessToken(fullClient.client_id);
   const fullList = await mcpRequest(fullAccess, 'tools/list');
-  assert.equal((await mcpJson(fullList)).result.tools.length, 36);
+  const fullTools = (await mcpJson(fullList)).result.tools;
+  assert.equal(fullTools.length, 37);
+  assert.ok(fullTools.some((tool) => tool.name === 'get_company_profile_values'));
 
   const defaultResponse = await fetch(`${baseUrl}/register`, {
     method: 'POST',
@@ -1054,16 +1056,16 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   assert.deepEqual(await invalidResponse.json(), { error: 'invalid_client_metadata' });
 });
 
-test('read-only clients see only the 25 allowlisted tools and cannot call a write tool', async () => {
+test('read-only clients see only the 26 allowlisted tools and cannot call a write tool', async () => {
   db.prepare('UPDATE clients SET scope = ? WHERE client_id = ?').run('read_only', clientId);
   const access = seedAccessToken(clientId);
   const listed = await mcpRequest(access, 'tools/list');
   assert.equal(listed.status, 200);
   const names = (await mcpJson(listed)).result.tools.map((tool) => tool.name);
-  assert.equal(names.length, 25);
+  assert.equal(names.length, 26);
   for (const name of [
     'list_activities', 'get_activity', 'get_activity_recipients', 'get_activity_thread',
-    'list_activity_attachments', 'list_matter_attachments', 'list_matter_collections',
+    'list_activity_attachments', 'list_matter_attachments', 'list_matter_collections', 'get_company_profile_values',
     'get_issue', 'list_issues', 'get_issue_profile_values', 'list_issue_activities',
     'list_quotes', 'get_quote', 'get_deal', 'get_project_plan', 'list_tasks',
     'get_task', 'list_task_progressions', 'get_project_profile_values', 'list_project_activities',
@@ -1092,11 +1094,11 @@ test('read-only clients see only the 25 allowlisted tools and cannot call a writ
 test('legacy NULL-scope and dangling-client tokens resolve to the intended capabilities', async () => {
   const legacyAccess = seedAccessToken('legacy-client');
   const legacyList = await mcpRequest(legacyAccess, 'tools/list');
-  assert.equal((await mcpJson(legacyList)).result.tools.length, 36);
+  assert.equal((await mcpJson(legacyList)).result.tools.length, 37);
 
   const orphanAccess = seedAccessToken('deleted-client');
   const orphanList = await mcpRequest(orphanAccess, 'tools/list');
-  assert.equal((await mcpJson(orphanList)).result.tools.length, 25);
+  assert.equal((await mcpJson(orphanList)).result.tools.length, 26);
 });
 
 test('full-scope write tools preserve the confirm:true preview response', async () => {
