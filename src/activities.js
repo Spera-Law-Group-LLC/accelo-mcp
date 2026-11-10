@@ -391,7 +391,7 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'list_activity_attachments',
-    'List attachment metadata for one Accelo activity. Does not download file contents. Pages are zero-based; when has_more is true, request the next page with the same limit. Read-only.',
+    'List attachment metadata for one Accelo activity. Does not download file contents. Pages are zero-based; when has_more is true, request page + 1 with the same limit. Read-only.',
     {
       activity_id: z.string().regex(/^\d+$/, 'activity_id must be a numeric ID').describe('Numeric activity ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results per page (default 50)'),
@@ -424,7 +424,7 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'list_matter_attachments',
-    'List attachment metadata across a job or issue’s activities, including each activity subject and logged date. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request the next page with the same limit. Read-only.',
+    'List attachment metadata across a job or issue’s activities, including each activity subject and logged date. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request page + 1 with the same limit. Read-only.',
     {
       against_type: z.enum(['job', 'issue']).describe('Matter type'),
       against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
