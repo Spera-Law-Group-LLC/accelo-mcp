@@ -56,6 +56,23 @@ const log = (...a) => console.log(new Date().toISOString(), '[activities]', ...a
 const TZ = process.env.ACCELO_TIMEZONE || 'America/Chicago';
 const LIBRECHAT_CLASS_ID = process.env.ACCELO_LIBRECHAT_CLASS_ID || '13';
 
+class ResourceScopeMismatchError extends Error {
+  constructor(mismatchCount) {
+    super('Accelo resource ownership could not be verified.');
+    this.mismatchCount = mismatchCount;
+  }
+}
+
+function resourceScopeMismatchCount(rows, scope) {
+  return rows.filter((row) => row == null || scope.some(({ field, value }) =>
+    row[field] == null || String(row[field]) !== String(value))).length;
+}
+
+function verifyResourceScope(rows, scope) {
+  const mismatchCount = resourceScopeMismatchCount(rows, scope);
+  if (mismatchCount) throw new ResourceScopeMismatchError(mismatchCount);
+}
+
 // Friendly parent names -> Accelo API against_type values. Accelo calls deals
 // "prospects" and contacts "affiliation"; the rest map 1:1. A "matter" is a job
 // or an issue (caller chooses which).
@@ -233,6 +250,7 @@ async function fetchActivityAttachments(token, activityId) {
       _page: upstreamPage,
     });
     if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
+    verifyResourceScope(json.response, [{ field: 'activity_id', value: activityId }]);
     return json.response;
   }, 100, 0);
   return {
@@ -391,7 +409,7 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'list_activity_attachments',
-    'List attachment metadata for one Accelo activity. Does not download file contents. Pages are zero-based; when has_more is true, request page + 1 with the same limit. Read-only.',
+    'List attachment metadata for one Accelo activity. Does not download file contents. Returns filter_not_applied without rows if Accelo returns resources outside the requested activity. Pages are zero-based; when has_more is true, request page + 1 with the same limit. Read-only.',
     {
       activity_id: z.string().regex(/^\d+$/, 'activity_id must be a numeric ID').describe('Numeric activity ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results per page (default 50)'),
@@ -399,16 +417,25 @@ export function registerActivityTools(server, subject) {
     },
     async ({ activity_id, limit = 50, page = 0 }) => {
       const token = await getValidAcceloToken(subject);
-      const window = await fetchWindow(async (upstreamPage, size) => {
-        const json = await acceloGet(token, '/resources', {
-          _filters: `activity_id(${activity_id})`,
-          _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,activity_id',
-          _limit: size,
-          _page: upstreamPage,
-        });
-        if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
-        return json.response;
-      }, limit, page);
+      let window;
+      try {
+        window = await fetchWindow(async (upstreamPage, size) => {
+          const json = await acceloGet(token, '/resources', {
+            _filters: `activity_id(${activity_id})`,
+            _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,activity_id',
+            _limit: size,
+            _page: upstreamPage,
+          });
+          if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
+          verifyResourceScope(json.response, [{ field: 'activity_id', value: activity_id }]);
+          return json.response;
+        }, limit, page);
+      } catch (error) {
+        if (error instanceof ResourceScopeMismatchError) {
+          return ok({ status: 'filter_not_applied', mismatch_count: error.mismatchCount });
+        }
+        throw error;
+      }
       const attachments = window.slice(0, limit).map((row) => ({
         id: row.id,
         title: row.title,
@@ -439,23 +466,30 @@ export function registerActivityTools(server, subject) {
       const attachments = [];
       let resourceCapped = false;
       let activitiesProcessed = 0;
-      for (const activity of activityWindow.activities) {
-        activitiesProcessed += 1;
-        const result = await fetchActivityAttachments(token, activity.id);
-        resourceCapped ||= result.has_more;
-        for (const attachment of result.attachments) {
-          if (attachments.length >= attachmentCap) {
-            resourceCapped = true;
-            break;
+      try {
+        for (const activity of activityWindow.activities) {
+          activitiesProcessed += 1;
+          const result = await fetchActivityAttachments(token, activity.id);
+          resourceCapped ||= result.has_more;
+          for (const attachment of result.attachments) {
+            if (attachments.length >= attachmentCap) {
+              resourceCapped = true;
+              break;
+            }
+            attachments.push({
+              ...attachment,
+              activity_id: String(activity.id),
+              activity_subject: activity.subject,
+              date_logged: activity.date_logged,
+            });
           }
-          attachments.push({
-            ...attachment,
-            activity_id: String(activity.id),
-            activity_subject: activity.subject,
-            date_logged: activity.date_logged,
-          });
+          if (attachments.length >= attachmentCap) break;
         }
-        if (attachments.length >= attachmentCap) break;
+      } catch (error) {
+        if (error instanceof ResourceScopeMismatchError) {
+          return ok({ status: 'filter_not_applied', mismatch_count: error.mismatchCount });
+        }
+        throw error;
       }
       const activityCapped = activityWindow.has_more;
       const capped = activityCapped || resourceCapped;
@@ -476,7 +510,7 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'list_matter_collections',
-    'List metadata for files uploaded directly to a job or issue. Returns resource rows tagged with collection ID and title, or source "owner" when using the owner-filter fallback. Unsupported endpoints return a typed error naming attempted paths and statuses. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request page + 1 with the same limit. Read-only.',
+    'List metadata for files uploaded directly to a job or issue. Returns resource rows tagged with collection ID and title, or source "owner" when using the owner-filter fallback. Resource ownership must match the requested collection or matter; unverified rows are discarded and the owner fallback is attempted. Unsupported endpoints return a typed error naming attempted paths and statuses. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request page + 1 with the same limit. Read-only.',
     {
       against_type: z.enum(['job', 'issue']).describe('Matter type'),
       against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
@@ -489,16 +523,25 @@ export function registerActivityTools(server, subject) {
       const attachmentCap = 1000;
 
       const attempts = [];
-      const fetchMetadata = async (path, query) => {
+      const fetchMetadata = async (path, query, scope) => {
         const attemptedPath = query._filters ? `${path}?_filters=${query._filters}` : path;
+        let json;
         try {
-          const json = await acceloGet(token, path, query);
-          attempts.push({ path: attemptedPath, status: 200 });
-          return json;
+          json = await acceloGet(token, path, query);
         } catch (error) {
           attempts.push({ path: attemptedPath, status: error.status ?? null });
           throw error;
         }
+        const attempt = { path: attemptedPath, status: 200 };
+        attempts.push(attempt);
+        if (scope && Array.isArray(json.response)) {
+          const mismatchCount = resourceScopeMismatchCount(json.response, scope);
+          if (mismatchCount) {
+            attempt.mismatch_count = mismatchCount;
+            throw new ResourceScopeMismatchError(mismatchCount);
+          }
+        }
+        return json;
       };
       let collectionWindow = [];
       let attachments = [];
@@ -524,10 +567,10 @@ export function registerActivityTools(server, subject) {
           const resourceWindow = await fetchWindow(async (upstreamPage, size) => {
             const json = await fetchMetadata('/resources', {
               _filters: `collection_id(${collectionId})`,
-              _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created',
+              _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,collection_id',
               _limit: size,
               _page: upstreamPage,
-            });
+            }, [{ field: 'collection_id', value: collectionId }]);
             if (!Array.isArray(json.response)) throw new Error('Accelo collection resources returned an invalid response.');
             return json.response;
           }, Math.min(100, attachmentCap - attachments.length), 0);
@@ -556,15 +599,18 @@ export function registerActivityTools(server, subject) {
           }
         }
       } catch (error) {
-        if (error.status !== 400 && error.status !== 404) throw error;
+        if (error.status !== 400 && error.status !== 404 && !(error instanceof ResourceScopeMismatchError)) throw error;
         try {
           const window = await fetchWindow(async (upstreamPage, size) => {
             const json = await fetchMetadata('/resources', {
               _filters: `owner_type(${against_type}),owner_id(${against_id})`,
-              _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created',
+              _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,owner_type,owner_id',
               _limit: size,
               _page: upstreamPage,
-            });
+            }, [
+              { field: 'owner_type', value: against_type },
+              { field: 'owner_id', value: against_id },
+            ]);
             if (!Array.isArray(json.response)) throw new Error('Accelo owner resources returned an invalid response.');
             return json.response;
           }, attachmentCap, 0);
@@ -585,7 +631,7 @@ export function registerActivityTools(server, subject) {
           return ok({
             status: 'error',
             error: 'collections_unavailable',
-            message: `Matter file lookup failed: ${attempts.map((attempt) => `${attempt.path}: ${attempt.status}`).join('; ')}. ${ownerError.message}`,
+            message: `Matter file lookup failed: ${attempts.map((attempt) => `${attempt.path}: ${attempt.status}`).join('; ')}.`,
             attempts,
           });
         }
