@@ -1,6 +1,31 @@
 import { config } from './config.js';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 const log = (...a) => console.log(new Date().toISOString(), '[accelo]', ...a);
+const retryBudget = new AsyncLocalStorage();
+
+export function withAcceloRetryBudget(callback) {
+  return retryBudget.run({ waitedMs: 0 }, callback);
+}
+
+function retryDelay(res, retryNumber) {
+  if (res.status === 429) {
+    const values = [];
+    const retryAfter = res.headers.get('retry-after');
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      const date = Date.parse(retryAfter);
+      if (Number.isFinite(seconds)) values.push(Math.max(0, seconds * 1000));
+      else if (Number.isFinite(date)) values.push(Math.max(0, date - Date.now()));
+    }
+    const reset = Number(res.headers.get('x-ratelimit-reset'));
+    if (Number.isFinite(reset) && reset > 0) {
+      values.push(Math.max(0, reset * 1000 - Date.now()));
+    }
+    if (values.length) return Math.max(...values);
+  }
+  return 1000 * (2 ** (retryNumber - 1));
+}
 
 // Fields we request back from Accelo for quotes. Accelo hides most fields
 // unless explicitly requested via _fields, and omits null/empty fields from
@@ -37,7 +62,7 @@ function normalizeQuote(q) {
   return q;
 }
 
-async function acceloFetch(token, pathname, { method = 'GET', query, body } = {}) {
+async function acceloFetch(token, pathname, { method = 'GET', query, body, allowError = false } = {}) {
   const url = new URL(config.acceloBaseUrl + pathname);
   if (query) {
     for (const [k, v] of Object.entries(query)) {
@@ -52,18 +77,43 @@ async function acceloFetch(token, pathname, { method = 'GET', query, body } = {}
     opts.headers['Content-Type'] = 'application/x-www-form-urlencoded';
     opts.body = new URLSearchParams(body).toString();
   }
-  const res = await fetch(url, opts);
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
-  if (!res.ok) {
+  const budget = retryBudget.getStore() || { waitedMs: 0 };
+  const canRetry = (status) => method === 'GET'
+    ? [429, 502, 503, 504].includes(status)
+    : status === 429;
+  for (let attempt = 1; ; attempt += 1) {
+    const res = await fetch(url, opts);
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch { json = { raw: text }; }
+    if (res.ok) return json;
+
+    if (attempt <= 3 && canRetry(res.status)) {
+      const backoffMs = retryDelay(res, attempt);
+      const remainingMs = Math.max(0, 20000 - budget.waitedMs);
+      if (remainingMs > 0) {
+        const waitMs = Math.min(backoffMs, remainingMs);
+        log('attempt', attempt, 'status', res.status, 'backoff_ms', waitMs);
+        budget.waitedMs += waitMs;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        if (waitMs === backoffMs) continue;
+      }
+    }
+
     const msg = (json && json.meta && json.meta.message) || text;
-    // Log the failing method + path + status + Accelo message (no token/body).
-    log('ERROR', method, pathname, res.status, '-', msg);
-    throw new Error(`Accelo API ${method} ${pathname} failed: ${res.status} ${msg}`);
+    if (allowError) return { ok: false, status: res.status, json, message: msg };
+    log('ERROR', 'attempt', attempt, 'status', res.status, 'backoff_ms', 0);
+    const error = new Error(`Accelo API ${method} ${pathname} failed: ${res.status} ${msg}`);
+    error.status = res.status;
+    throw error;
   }
-  return json;
 }
+
+export const acceloGet = (token, pathname, query) => acceloFetch(token, pathname, { query });
+export const acceloPost = (token, pathname, body) => acceloFetch(token, pathname, { method: 'POST', body });
+export const acceloPut = (token, pathname, body) => acceloFetch(token, pathname, { method: 'PUT', body });
+export const acceloTryPost = (token, pathname, body) =>
+  acceloFetch(token, pathname, { method: 'POST', body, allowError: true });
 
 export async function listQuotes(token, { search, limit = 25, page = 0, filters } = {}) {
   const query = { _fields: QUOTE_FIELDS, _limit: limit, _page: page };

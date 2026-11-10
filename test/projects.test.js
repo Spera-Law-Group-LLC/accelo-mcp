@@ -274,9 +274,15 @@ test('get_job returns typed not_found only for HTTP 400 and 404', async (t) => {
         assert.deepEqual(await callTool('get_job', { job_id: '321' }),
           { status: 'not_found', object_type: 'job' });
       } else {
+        if (status === 429) {
+          t.mock.method(globalThis, 'setTimeout', (callback) => {
+            queueMicrotask(callback);
+            return 0;
+          });
+        }
         await assert.rejects(callTool('get_job', { job_id: '321' }), new RegExp(` ${status} `));
       }
-      assert.equal(requests.length, 1);
+      assert.equal(requests.length, status === 429 ? 4 : 1);
     });
   }
 });

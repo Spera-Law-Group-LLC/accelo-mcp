@@ -27,6 +27,7 @@ running container actually serves the new code.
 The repo checkout at `/opt/accelo-mcp` is owned by **`deploy:deploy`**. The `mcp`
 SSH user **cannot** advance `.git` (that is by design — see librechat-infra #67).
 Every `git` and `docker compose` command below MUST run as `deploy`:
+No git operation may ever run as root.
 
 ```bash
 sudo -u deploy -i          # become deploy (login shell) BEFORE anything else
@@ -38,6 +39,7 @@ Confirm you are actually `deploy` and own the tree before continuing:
 ```bash
 id -un                     # -> deploy
 stat -c '%U' .git          # -> deploy
+[ -z "$(find .git ! -user deploy -print -quit)" ] || { echo "OWNERSHIP MISMATCH — STOP"; exit 1; }
 ```
 
 If either is not `deploy`, STOP — running the rest as another user is exactly
@@ -111,6 +113,15 @@ though it is `Up` and healthy. Rebuild without cache and re-assert:
 docker compose build --no-cache accelo-mcp && docker compose up -d
 docker compose exec accelo-mcp grep -c "list_issues" /app/src/issues.js
 ```
+
+---
+
+## Scripted deploy
+
+The pre-build and post-build assertions above can be run in one shell script with
+`set -e` so any failed ownership, source, build, or in-image check aborts the
+deploy. Keep such a script on the host; do not add a host-specific deploy script
+to this repository.
 
 ---
 

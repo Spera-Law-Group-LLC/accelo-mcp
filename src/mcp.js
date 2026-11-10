@@ -1,11 +1,13 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as accelo from './accelo.js';
+import { withAcceloRetryBudget } from './accelo.js';
 import { getValidAcceloToken } from './oauth.js';
 import { config } from './config.js';
 import { registerProjectTools } from './projects.js';
 import { registerActivityTools } from './activities.js';
 import { registerIssueTools } from './issues.js';
+import { registerCompanyTools } from './companies.js';
 
 function ok(data) {
   return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
@@ -83,15 +85,27 @@ const READ_TOOLS = new Set([
   'list_task_progressions',
   'get_project_profile_values',
   'list_project_activities',
+  'search_companies',
+  'get_company',
+  'get_matter_contacts',
+  'list_activity_attachments',
+  'list_matter_attachments',
+  'list_matter_collections',
 ]);
 
 export function scopedServer(server, scope) {
-  if (scope !== 'read_only') return server;
   return new Proxy(server, {
     get(target, prop, receiver) {
       if (prop !== 'tool') return Reflect.get(target, prop, receiver);
-      return (name, ...rest) =>
-        READ_TOOLS.has(name) ? target.tool(name, ...rest) : undefined;
+      return (name, ...rest) => {
+        if (scope === 'read_only' && !READ_TOOLS.has(name)) return undefined;
+        const handlerIndex = rest.length - 1;
+        if (typeof rest[handlerIndex] === 'function') {
+          const handler = rest[handlerIndex];
+          rest[handlerIndex] = (...args) => withAcceloRetryBudget(() => handler(...args));
+        }
+        return target.tool(name, ...rest);
+      };
     },
   });
 }
@@ -109,7 +123,7 @@ export function buildServer(subject, scope = 'full') {
     {
       search: z.string().optional().describe('Free-text search across the quote title'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
-      page: z.number().int().min(0).optional().describe('Zero-based page number'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
       filters: z.string().max(500).optional().describe("ADVANCED: raw Accelo _filters expression forwarded verbatim, e.g. standing(active). BYPASSES any structured scoping; max 500 chars."),
     },
     async ({ search, limit, page, filters }) => {
@@ -258,6 +272,8 @@ export function buildServer(subject, scope = 'full') {
 
   // Issue tools (issue records, profile values + scoped activities).
   registerIssueTools(tools, subject);
+
+  registerCompanyTools(tools, subject);
 
   return server;
 }

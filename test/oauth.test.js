@@ -802,28 +802,26 @@ test('authorize renders consent without reaching Accelo and defaults the stored 
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
 });
 
-test('localhost HTTP redirect URI is accepted while a hostile URI path is not rendered', async () => {
+test('hostile redirect URI registered through POST is not rendered as markup', async () => {
   const localRedirect = 'http://localhost:3080/cb';
+  const hostileRedirect = 'https://client.example/"><script>alert(1)</script>';
   const registration = await fetch(`${baseUrl}/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ redirect_uris: [localRedirect] }),
+    body: JSON.stringify({ redirect_uris: [localRedirect, hostileRedirect] }),
   });
   assert.equal(registration.status, 201);
   const client = await registration.json();
   await waitForOutput('redirect_origins=http://localhost:3080');
 
-  const hostileRedirect = 'https://client.example/"><script>alert(1)</script>';
-  db.prepare('UPDATE clients SET redirect_uris = ? WHERE client_id = ?')
-    .run(JSON.stringify([hostileRedirect]), client.client_id);
   const authorization = await authorize({
     client_id: client.client_id,
     redirect_uri: hostileRedirect,
   });
   assert.equal(authorization.status, 200);
   const html = await authorization.text();
-  assert.ok(!html.includes('"><script>'), 'hostile path markup is not emitted raw');
-  assert.ok(!html.includes(hostileRedirect), 'the full redirect URI is not rendered');
+  assert.ok(!html.includes('"><script>'), 'registered hostile markup is not emitted raw');
+  assert.ok(!html.includes(hostileRedirect), 'the registered full URI is not rendered');
   assert.match(html, /https:\/\/client\.example/);
 });
 
@@ -996,7 +994,7 @@ test('registered confidential client completes PKCE authorization, callback, red
   const listed = await mcpRequest(issued.access_token, 'tools/list');
   assert.equal(listed.status, 200);
   const listedBody = await mcpJson(listed);
-  assert.equal(listedBody.result.tools.length, 30, 'dynamically registered LibreChat clients retain all tools');
+  assert.equal(listedBody.result.tools.length, 36, 'dynamically registered LibreChat clients retain all tools');
   assert.equal((await token(request)).status, 400);
   const refreshRequest = {
     grant_type: 'refresh_token', refresh_token: issued.refresh_token,
@@ -1035,7 +1033,7 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   assert.equal(fullClient.scope, 'full');
   const fullAccess = seedAccessToken(fullClient.client_id);
   const fullList = await mcpRequest(fullAccess, 'tools/list');
-  assert.equal((await mcpJson(fullList)).result.tools.length, 30);
+  assert.equal((await mcpJson(fullList)).result.tools.length, 36);
 
   const defaultResponse = await fetch(`${baseUrl}/register`, {
     method: 'POST',
@@ -1056,18 +1054,20 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   assert.deepEqual(await invalidResponse.json(), { error: 'invalid_client_metadata' });
 });
 
-test('read-only clients see only the 19 allowlisted tools and cannot call a write tool', async () => {
+test('read-only clients see only the 25 allowlisted tools and cannot call a write tool', async () => {
   db.prepare('UPDATE clients SET scope = ? WHERE client_id = ?').run('read_only', clientId);
   const access = seedAccessToken(clientId);
   const listed = await mcpRequest(access, 'tools/list');
   assert.equal(listed.status, 200);
   const names = (await mcpJson(listed)).result.tools.map((tool) => tool.name);
-  assert.equal(names.length, 19);
+  assert.equal(names.length, 25);
   for (const name of [
     'list_activities', 'get_activity', 'get_activity_recipients', 'get_activity_thread',
+    'list_activity_attachments', 'list_matter_attachments', 'list_matter_collections',
     'get_issue', 'list_issues', 'get_issue_profile_values', 'list_issue_activities',
     'list_quotes', 'get_quote', 'get_deal', 'get_project_plan', 'list_tasks',
     'get_task', 'list_task_progressions', 'get_project_profile_values', 'list_project_activities',
+    'search_companies', 'get_company', 'get_matter_contacts',
   ]) {
     assert.ok(names.includes(name), `${name} is registered for read-only clients`);
   }
@@ -1092,11 +1092,11 @@ test('read-only clients see only the 19 allowlisted tools and cannot call a writ
 test('legacy NULL-scope and dangling-client tokens resolve to the intended capabilities', async () => {
   const legacyAccess = seedAccessToken('legacy-client');
   const legacyList = await mcpRequest(legacyAccess, 'tools/list');
-  assert.equal((await mcpJson(legacyList)).result.tools.length, 30);
+  assert.equal((await mcpJson(legacyList)).result.tools.length, 36);
 
   const orphanAccess = seedAccessToken('deleted-client');
   const orphanList = await mcpRequest(orphanAccess, 'tools/list');
-  assert.equal((await mcpJson(orphanList)).result.tools.length, 19);
+  assert.equal((await mcpJson(orphanList)).result.tools.length, 25);
 });
 
 test('full-scope write tools preserve the confirm:true preview response', async () => {

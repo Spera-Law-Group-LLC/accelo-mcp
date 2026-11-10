@@ -10,9 +10,10 @@ process.env.ACCELO_CLIENT_ID = 'test-client';
 process.env.ACCELO_CLIENT_SECRET = 'test-secret';
 process.env.TOKEN_DB_PATH = path.join(directory, 'tokens.db');
 
-const [{ scopedServer }, { default: db }] = await Promise.all([
+const [{ scopedServer }, { default: db }, { acceloGet }] = await Promise.all([
   import('../src/mcp.js'),
   import('../src/db.js'),
+  import('../src/accelo.js'),
 ]);
 
 after(async () => {
@@ -42,3 +43,35 @@ test('read-only registration includes job discovery and detail tools', () => {
 
   assert.deepEqual(registered, ['list_jobs', 'get_job']);
 });
+
+for (const scope of ['full', 'read_only']) {
+  test(`${scope} tool handlers share a 20-second retry budget`, async (t) => {
+    const delays = [];
+    t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
+      delays.push(delay);
+      queueMicrotask(callback);
+      return 0;
+    });
+    t.mock.method(globalThis, 'fetch', async () =>
+      Response.json({ meta: { message: 'rate limited' } }, {
+        status: 429,
+        headers: { 'Retry-After': '15' },
+      }));
+
+    let handler;
+    const server = {
+      tool(name, ...args) {
+        handler = args.at(-1);
+        return name;
+      },
+    };
+    const scoped = scopedServer(server, scope);
+    scoped.tool('list_activities', 'test tool', {}, async () => {
+      await acceloGet('token', '/first');
+      await acceloGet('token', '/second');
+    });
+
+    await assert.rejects(handler(), { status: 429 });
+    assert.deepEqual(delays, [15000, 5000]);
+  });
+}
