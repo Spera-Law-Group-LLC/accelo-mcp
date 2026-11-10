@@ -163,7 +163,183 @@ test('get_matter_contacts returns affiliated contacts and flags the matter affil
   assert.equal(result.contacts[1].is_matter_affiliation, false);
   assert.equal(result.has_more, false);
   assert.equal(result.roster_filter, 'company');
+  assert.equal(result.duplicates_collapsed, 0);
   assert.ok(requests.some((url) => url.pathname === '/api/v0/affiliations'));
+});
+
+for (const field of ['email', 'phone', 'mobile', 'position']) {
+  test(`get_matter_contacts resolves duplicate affiliations with conflicting ${field}`, async (t) => {
+    const details = [];
+    const canonical = {
+      id: '502', company: '10', email: 'canonical@example.test',
+      phone: '555-0102', mobile: '555-0103', position: 'Manager',
+      contact: { id: '6', firstname: 'Contact', email: 'other@example.test', phone: '555-0199' },
+    };
+    t.mock.method(globalThis, 'fetch', async (input) => {
+      const url = new URL(input);
+      if (url.pathname === '/api/v0/jobs/20') {
+        return Response.json({ response: { company: '10', affiliation: '501' } });
+      }
+      if (url.pathname === '/api/v0/affiliations') {
+        const rows = [
+          { id: '501', company: '10' },
+          ...Array.from({ length: 3 }, (_, index) => ({
+            ...canonical, id: index === 1 ? 502 : '502', [field]: `conflict-${index}`,
+          })),
+        ];
+        const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+        const page = Number(url.searchParams.get('_page'));
+        return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+      }
+      details.push(url);
+      if (url.pathname === '/api/v0/affiliations/501') {
+        return Response.json({ response: { id: '501', company: '10', contact: { id: '5' } } });
+      }
+      assert.equal(url.pathname, '/api/v0/affiliations/502');
+      return Response.json({ response: [canonical] });
+    });
+    const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
+    assert.equal(result.contacts.length, 2);
+    assert.equal(result.duplicates_collapsed, 2);
+    assert.equal(result.has_more, false);
+    assert.equal(result.roster_filter, 'company');
+    assert.equal(result.unresolved_affiliation_ids, undefined);
+    for (const key of ['email', 'phone', 'mobile', 'position']) {
+      assert.equal(result.contacts[1][key], canonical[key]);
+    }
+    assert.equal(details.length, 2);
+    assert.equal(details[0].searchParams.get('_fields'), details[1].searchParams.get('_fields'));
+  });
+}
+
+test('get_matter_contacts collapses agreeing duplicates without fetching details', async (t) => {
+  const details = [];
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    if (url.pathname === '/api/v0/jobs/20') {
+      return Response.json({ response: { company: '10', affiliation: '501' } });
+    }
+    if (url.pathname === '/api/v0/affiliations/501') {
+      details.push(url.pathname);
+      return Response.json({ response: { id: '501', company: '10', email: 'own@example.test' } });
+    }
+    assert.equal(url.pathname, '/api/v0/affiliations');
+    const row = { id: '502', company: '10', email: 'affiliation@example.test', contact: { id: '6', email: 'other@example.test' } };
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    const page = Number(url.searchParams.get('_page'));
+    return Response.json({ response: [row, { ...row, phone: null }, row].slice(page * limit, (page + 1) * limit) });
+  });
+  const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
+  assert.equal(result.contacts.length, 2);
+  assert.equal(result.contacts[1].email, 'affiliation@example.test');
+  assert.equal(result.duplicates_collapsed, 2);
+  assert.deepEqual(details, ['/api/v0/affiliations/501']);
+});
+
+for (const outcome of ['http', 'empty', 'wrong_id', 'wrong_company', 'missing_fields']) {
+  test(`get_matter_contacts fails closed for conflicting duplicates (${outcome})`, async (t) => {
+    let refetches = 0;
+    t.mock.method(globalThis, 'fetch', async (input) => {
+      const url = new URL(input);
+      if (url.pathname === '/api/v0/jobs/20') {
+        return Response.json({ response: { company: '10', affiliation: '501' } });
+      }
+      if (url.pathname === '/api/v0/affiliations/501') {
+        return Response.json({ response: { id: '501', company: '10' } });
+      }
+      if (url.pathname === '/api/v0/affiliations/502') {
+        refetches += 1;
+        if (outcome === 'http') {
+          return Response.json({ meta: { message: 'private@example.test' } }, { status: 403 });
+        }
+        return Response.json({ response: outcome === 'empty' ? [] : {
+          id: outcome === 'wrong_id' ? '999' : '502',
+          company: outcome === 'wrong_company' ? '99' : '10',
+          contact: { id: '6', email: 'nested@example.test', phone: '555-0199', mobile: '555-0198', position: 'Other' },
+        } });
+      }
+      assert.equal(url.pathname, '/api/v0/affiliations');
+      const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+      const page = Number(url.searchParams.get('_page'));
+      return Response.json({ response: ['first', 'second'].map((value) => ({
+        id: '502', company: '10', email: `${value}@example.test`,
+        phone: value, mobile: value, position: value, contact: { id: '6' },
+      })).slice(page * limit, (page + 1) * limit) });
+    });
+    const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
+    assert.equal(result.contacts.length, 2);
+    assert.equal(result.duplicates_collapsed, 1);
+    for (const field of ['email', 'phone', 'mobile', 'position']) {
+      assert.equal(result.contacts[1][field], null);
+    }
+    assert.deepEqual(result.unresolved_affiliation_ids, outcome === 'missing_fields' ? undefined : ['502']);
+    assert.equal(result.roster_filter, 'company');
+    assert.equal(result.roster_error, undefined);
+    assert.equal(refetches, 1);
+    assert.equal(JSON.stringify(result).includes('private@example.test'), false);
+  });
+}
+
+test('get_matter_contacts keeps the canonical own affiliation despite conflicting roster copies', async (t) => {
+  let detailCalls = 0;
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    if (url.pathname === '/api/v0/jobs/20') {
+      return Response.json({ response: { company: '10', affiliation: '501' } });
+    }
+    if (url.pathname === '/api/v0/affiliations/501') {
+      detailCalls += 1;
+      return Response.json({ response: { id: '501', company: '10', email: 'canonical@example.test' } });
+    }
+    assert.equal(url.pathname, '/api/v0/affiliations');
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    const page = Number(url.searchParams.get('_page'));
+    return Response.json({ response: ['first', 'second', 'third'].map((value) => ({
+      id: '501', company: '10', email: `${value}@example.test`,
+    })).slice(page * limit, (page + 1) * limit) });
+  });
+  const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
+  assert.equal(result.contacts.length, 1);
+  assert.equal(result.contacts[0].email, 'canonical@example.test');
+  assert.equal(result.contacts[0].is_matter_affiliation, true);
+  assert.equal(result.duplicates_collapsed, 2);
+  assert.equal(detailCalls, 1);
+});
+
+test('get_matter_contacts detects conflicts in the capped lookahead page', async (t) => {
+  const pages = [];
+  let refetches = 0;
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    if (url.pathname === '/api/v0/jobs/20') {
+      return Response.json({ response: { company: '10', affiliation: '501' } });
+    }
+    if (url.pathname === '/api/v0/affiliations/501') {
+      return Response.json({ response: { id: '501', company: '10' } });
+    }
+    if (url.pathname === '/api/v0/affiliations/502') {
+      refetches += 1;
+      return Response.json({ response: { id: '502', company: '10', email: 'canonical@example.test' } });
+    }
+    assert.equal(url.pathname, '/api/v0/affiliations');
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    const page = Number(url.searchParams.get('_page'));
+    pages.push(page);
+    const rows = [
+      { id: '502', company: '10', email: 'first@example.test' },
+      ...Array.from({ length: 99 }, (_, index) => ({ id: String(1000 + index), company: '10' })),
+      { id: '502', company: '10', email: 'second@example.test' },
+    ];
+    return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+  });
+  const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
+  assert.equal(result.contacts.length, 101);
+  assert.equal(new Set(result.contacts.map((row) => row.affiliation_id)).size, 101);
+  assert.equal(result.contacts[1].email, 'canonical@example.test');
+  assert.equal(result.duplicates_collapsed, 1);
+  assert.equal(result.has_more, true);
+  assert.equal(refetches, 1);
+  assert.deepEqual(pages, [0, 1]);
 });
 
 test('get_matter_contacts returns an explicit empty result when the matter has no affiliation', async (t) => {
@@ -176,7 +352,7 @@ test('get_matter_contacts returns an explicit empty result when the matter has n
   const result = await call('get_matter_contacts', { against_type: 'issue', against_id: '20' });
   assert.deepEqual(result, {
     against_type: 'issue', against_id: '20', affiliation_id: null,
-    status: 'no_affiliation', contacts: [], has_more: false,
+    status: 'no_affiliation', contacts: [], has_more: false, duplicates_collapsed: 0,
   });
   assert.equal(requests.length, 1);
 });

@@ -141,6 +141,7 @@ export function registerCompanyTools(server, subject) {
           status: 'no_affiliation',
           contacts: [],
           has_more: false,
+          duplicates_collapsed: 0,
         });
       }
       const fields = 'id,contact(id,firstname,surname,email),email,phone,mobile,position,company,standing';
@@ -160,11 +161,11 @@ export function registerCompanyTools(server, subject) {
           firstname: contact.firstname ?? null,
           surname: contact.surname ?? null,
           name: contact.name ?? ([contact.firstname, contact.surname].filter(Boolean).join(' ') || row.name || null),
-          email: contact.email ?? row.email ?? null,
-          phone: contact.phone ?? row.phone ?? null,
-          mobile: row.mobile ?? contact.mobile ?? null,
+          email: row.email ?? null,
+          phone: row.phone ?? null,
+          mobile: row.mobile ?? null,
           affiliation_id: affiliationId,
-          position: row.position ?? contact.position ?? null,
+          position: row.position ?? null,
           role: row.role ?? contact.role ?? null,
           standing: row.standing ?? contact.standing ?? null,
           is_matter_affiliation: String(affiliationId) === String(ownAffiliationId),
@@ -176,6 +177,7 @@ export function registerCompanyTools(server, subject) {
         affiliation_id: String(ownAffiliationId),
         contacts: [toContact({ ...ownAffiliation, id: ownAffiliationId })],
         has_more: false,
+        duplicates_collapsed: 0,
       };
       try {
         if (companyId == null) throw new Error('Matter affiliation has no resolvable company ID.');
@@ -203,9 +205,42 @@ export function registerCompanyTools(server, subject) {
         ]) {
           try {
             const window = await fetchRoster(filter);
-            result.contacts.push(...window.slice(0, 100)
-              .filter((row) => String(relationId(row)) !== String(ownAffiliationId))
-              .map(toContact));
+            const affiliations = new Map();
+            const conflicts = new Set();
+            const affiliationFields = ['email', 'phone', 'mobile', 'position'];
+            for (const row of window) {
+              const id = String(relationId(row));
+              const previous = affiliations.get(id);
+              if (previous) {
+                if (affiliationFields.some((field) => (previous[field] ?? null) !== (row[field] ?? null))) {
+                  conflicts.add(id);
+                }
+              } else {
+                affiliations.set(id, row);
+              }
+            }
+            result.duplicates_collapsed = window.length - affiliations.size;
+            const rosterIds = new Set(window.slice(0, 100).map((row) => String(relationId(row))));
+            for (const [id, row] of affiliations) {
+              if (!rosterIds.has(id) || id === String(ownAffiliationId)) continue;
+              let resolved = row;
+              if (conflicts.has(id)) {
+                try {
+                  const response = (await acceloGet(token, `/affiliations/${encodeURIComponent(id)}`, {
+                    _fields: fields,
+                  })).response;
+                  resolved = Array.isArray(response) ? response[0] : response;
+                  if (!resolved || String(relationId(resolved)) !== id ||
+                      String(relationId(resolved.company) ?? resolved.company_id) !== String(companyId)) {
+                    throw new Error('Accelo canonical affiliation returned an invalid record.');
+                  }
+                } catch {
+                  resolved = { ...row, email: null, phone: null, mobile: null, position: null };
+                  (result.unresolved_affiliation_ids ??= []).push(id);
+                }
+              }
+              result.contacts.push(toContact(resolved));
+            }
             result.has_more = window.length > 100;
             result.roster_filter = name;
             return ok(result);
