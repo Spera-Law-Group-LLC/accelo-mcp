@@ -133,7 +133,7 @@ test('get_matter_contacts returns affiliated contacts and flags the matter affil
       } });
     }
     if (url.pathname === '/api/v0/affiliations') {
-      assert.equal(url.searchParams.get('_filters'), 'company_id(10)');
+      assert.equal(url.searchParams.get('_filters'), 'company(10)');
       const limit = Math.min(100, Number(url.searchParams.get('_limit')));
       return Response.json({
         response: [{
@@ -162,6 +162,7 @@ test('get_matter_contacts returns affiliated contacts and flags the matter affil
   assert.equal(result.contacts.length, 2);
   assert.equal(result.contacts[1].is_matter_affiliation, false);
   assert.equal(result.has_more, false);
+  assert.equal(result.roster_filter, 'company');
   assert.ok(requests.some((url) => url.pathname === '/api/v0/affiliations'));
 });
 
@@ -180,7 +181,7 @@ test('get_matter_contacts returns an explicit empty result when the matter has n
   assert.equal(requests.length, 1);
 });
 
-test('get_matter_contacts preserves the own affiliation when both roster filters fail', async (t) => {
+test('get_matter_contacts preserves the own affiliation when all roster filters fail', async (t) => {
   const filters = [];
   t.mock.method(globalThis, 'fetch', async (input) => {
     const url = new URL(input);
@@ -195,34 +196,71 @@ test('get_matter_contacts preserves the own affiliation when both roster filters
     return Response.json({ meta: { message: 'resource endpoint was not recognized' } }, { status: 400 });
   });
   const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
-  assert.deepEqual(filters, ['company_id(10)', 'company(10)']);
-  assert.match(result.roster_error, /^400 .*resource endpoint was not recognized/);
+  assert.deepEqual(filters, ['company(10)', 'company_id(10)', 'against_type(company),against_id(10)']);
+  assert.equal(result.roster_error, 'company(10): 400; company_id(10): 400; against_type(company),against_id(10): 400');
   assert.equal(result.contacts.length, 1);
   assert.equal(result.contacts[0].name, 'Contact One');
   assert.equal(result.contacts[0].is_matter_affiliation, true);
 });
 
-test('get_matter_contacts retries company after company_id returns 400', async (t) => {
+for (const outcome of ['400', 'mismatch', 'invalid', '403']) {
+  test(`get_matter_contacts retries company_id after company returns ${outcome}`, async (t) => {
+    const filters = [];
+    t.mock.method(globalThis, 'fetch', async (input) => {
+      const url = new URL(input);
+      if (url.pathname === '/api/v0/issues/20') {
+        return Response.json({ response: { affiliation_id: '501' } });
+      }
+      if (url.pathname === '/api/v0/affiliations/501') {
+        return Response.json({ response: { id: '501', company: { id: '10' }, contact: { id: '5' } } });
+      }
+      const filter = url.searchParams.get('_filters');
+      filters.push(filter);
+      const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+      if (filter === 'company(10)') {
+        if (outcome === 'mismatch') {
+          return Response.json({ response: Array.from({ length: 100 }, (_, index) => ({
+            id: String(1000 + index), company: '99', contact: { firstname: 'Foreign' },
+          })).slice(0, limit) });
+        }
+        if (outcome === 'invalid') return Response.json({ response: { unknown: 'private' } });
+        return Response.json({ meta: { message: 'unsupported filter' } }, { status: Number(outcome) });
+      }
+      return Response.json({ response: [{ id: '502', company: '10', contact: { id: '6' } }].slice(0, limit) });
+    });
+    const result = await call('get_matter_contacts', { against_type: 'issue', against_id: '20' });
+    assert.deepEqual(filters, ['company(10)', 'company_id(10)']);
+    assert.equal(result.contacts.length, 2);
+    assert.equal(result.roster_filter, 'company_id');
+    assert.equal(result.status, undefined);
+    assert.equal(JSON.stringify(result).includes('Foreign'), false);
+    assert.equal(result.roster_error, undefined);
+  });
+}
+
+test('get_matter_contacts tries the against filter after both company filters fail', async (t) => {
   const filters = [];
   t.mock.method(globalThis, 'fetch', async (input) => {
     const url = new URL(input);
-    if (url.pathname === '/api/v0/issues/20') {
-      return Response.json({ response: { affiliation_id: '501' } });
+    if (url.pathname === '/api/v0/jobs/20') {
+      return Response.json({ response: { company: '10', affiliation: '501' } });
     }
     if (url.pathname === '/api/v0/affiliations/501') {
-      return Response.json({ response: { id: '501', company: { id: '10' }, contact: { id: '5' } } });
+      return Response.json({ response: { id: '501', contact: { id: '5' } } });
     }
     const filter = url.searchParams.get('_filters');
     filters.push(filter);
-    if (filter === 'company_id(10)') {
-      return Response.json({ meta: { message: 'unsupported filter' } }, { status: 400 });
-    }
-    return Response.json({ response: [{ id: '502', company: '10', contact: { id: '6' } }] });
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    return Response.json({ response: [{
+      id: '502', company: filter.startsWith('against_type') ? '10' : '99', contact: { id: '6' },
+    }].slice(0, limit) });
   });
-  const result = await call('get_matter_contacts', { against_type: 'issue', against_id: '20' });
-  assert.deepEqual(filters, ['company_id(10)', 'company(10)']);
-  assert.equal(result.contacts.length, 2);
+  const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
+  assert.deepEqual(filters, ['company(10)', 'company_id(10)', 'against_type(company),against_id(10)']);
+  assert.equal(result.roster_filter, 'against_type,against_id');
+  assert.deepEqual(result.contacts.map((row) => row.id), ['5', '6']);
   assert.equal(result.roster_error, undefined);
+  assert.equal(result.status, undefined);
 });
 
 for (const company of ['99', null]) {
@@ -235,14 +273,17 @@ for (const company of ['99', null]) {
       if (url.pathname === '/api/v0/affiliations/501') {
         return Response.json({ response: { id: '501', contact: { id: '5' } } });
       }
+      const limit = Math.min(100, Number(url.searchParams.get('_limit')));
       return Response.json({ response: [
         { id: '502', company: '10', contact: { id: '6' } },
         { id: '999', company, contact: { id: '99', firstname: 'Foreign' } },
-      ] });
+      ].slice(0, limit) });
     });
     const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
     assert.equal(result.status, 'filter_not_applied');
     assert.equal(result.mismatch_count, 1);
+    assert.equal(result.roster_error, 'company(10): mismatch:1; company_id(10): mismatch:1; against_type(company),against_id(10): mismatch:1');
+    assert.equal(result.roster_filter, undefined);
     assert.deepEqual(result.contacts.map((row) => row.affiliation_id), ['501']);
     assert.equal(JSON.stringify(result).includes('Foreign'), false);
   });
@@ -267,7 +308,7 @@ test('get_matter_contacts verifies subsequent capped roster pages', async (t) =>
     return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
   });
   const result = await call('get_matter_contacts', { against_type: 'job', against_id: '20' });
-  assert.deepEqual(pages, [0, 1]);
+  assert.deepEqual(pages, [0, 1, 0, 1, 0, 1]);
   assert.equal(result.status, 'filter_not_applied');
   assert.equal(result.contacts.length, 1);
 });
