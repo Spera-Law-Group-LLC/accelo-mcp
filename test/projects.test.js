@@ -9,6 +9,7 @@ const directory = await mkdtemp(path.join(tmpdir(), 'accelo-mcp-projects-'));
 process.env.PUBLIC_BASE_URL = 'http://127.0.0.1';
 process.env.ACCELO_CLIENT_ID = 'test-client';
 process.env.ACCELO_CLIENT_SECRET = randomBytes(24).toString('base64url');
+process.env.ACCELO_BASE_URL = 'https://test.api.accelo.com/api/v0';
 process.env.TOKEN_DB_PATH = path.join(directory, 'tokens.db');
 
 const [{ registerProjectTools }, { default: db }] = await Promise.all([
@@ -73,7 +74,11 @@ function mockAccelo(t, sources, { milestones = [], rejectOrder = false, failMile
 }
 
 async function call(args) {
-  const tool = tools.get('list_project_activities');
+  return callTool('list_project_activities', args);
+}
+
+async function callTool(name, args) {
+  const tool = tools.get(name);
   for (const [key, schema] of Object.entries(tool.schema)) schema.parse(args[key]);
   return JSON.parse((await tool.handler(args)).content[0].text);
 }
@@ -150,4 +155,140 @@ test('milestone listing continues past the first 100 rows', async (t) => {
 
   assert.equal(result.milestones_scanned, 101);
   assert.deepEqual(milestoneRequests.map((url) => url.searchParams.get('_page')), ['0', '1']);
+});
+
+function companyJobs(count, companyId = '321') {
+  return Array.from({ length: count }, (_, index) => ({
+    id: String(index + 1),
+    title: `Matter ${index + 1}`,
+    against_type: 'company',
+    against_id: companyId,
+    standing: ['active', 'inactive', 'paused', 'closed', 'complete'][index % 5],
+    job_status: 'status',
+    date_started: '1700000000',
+    date_completed: null,
+  }));
+}
+
+function mockJobReads(t, handler) {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    requests.push(url);
+    const response = await handler(url);
+    return response instanceof Response ? response : Response.json(response);
+  });
+  return requests;
+}
+
+test('list_jobs rejects rows when Accelo ignores the company filter', async (t) => {
+  mockJobReads(t, () => ({ response: companyJobs(1, '999') }));
+  const result = await callTool('list_jobs', { company_id: '321' });
+
+  assert.deepEqual(result, { status: 'filter_not_applied', mismatch_count: 1 });
+  assert.equal(Object.hasOwn(result, 'jobs'), false);
+});
+
+test('list_jobs paginates without gaps and preserves Accelo standings', async (t) => {
+  const rows = companyJobs(5);
+  const requests = mockJobReads(t, (url) => {
+    assert.equal(url.pathname, '/api/v0/jobs');
+    assert.equal(url.searchParams.get('_filters'), 'against_type(company),against_id(321)');
+    const limit = Number(url.searchParams.get('_limit'));
+    const page = Number(url.searchParams.get('_page'));
+    return { response: rows.slice(page * limit, (page + 1) * limit), meta: { total: rows.length } };
+  });
+
+  const first = await callTool('list_jobs', { company_id: '321', limit: 2, page: 0 });
+  const second = await callTool('list_jobs', { company_id: '321', limit: 2, page: 1 });
+  const third = await callTool('list_jobs', { company_id: '321', limit: 2, page: 2 });
+
+  assert.deepEqual(first.jobs.map((job) => job.id), ['1', '2']);
+  assert.equal(first.has_more, true);
+  assert.deepEqual(second.jobs.map((job) => job.id), ['3', '4']);
+  assert.equal(second.has_more, true);
+  assert.deepEqual(third.jobs.map((job) => job.id), ['5']);
+  assert.equal(third.has_more, false);
+  assert.deepEqual([...first.jobs, ...second.jobs, ...third.jobs].map((job) => job.standing),
+    ['active', 'inactive', 'paused', 'closed', 'complete']);
+  assert.notEqual(second.jobs[1].standing, 'active');
+  assert.equal(first.total, 5);
+  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '3'));
+  assert.ok(requests.every((url) => url.searchParams.has('_page')));
+  assert.equal(first.jobs[0].url, 'https://test.accelo.com/?action=view_job&id=1');
+});
+
+test('get_job returns a typed not_found for an ID that is not a job', async (t) => {
+  const requests = mockJobReads(t, (url) => {
+    if (url.pathname === '/api/v0/jobs/321') return { response: null };
+    if (url.pathname === '/api/v0/issues/321') return { response: { id: '321' } };
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+
+  const result = await callTool('get_job', { job_id: '321' });
+
+  assert.deepEqual(result, { status: 'not_found', object_type: 'job' });
+  assert.deepEqual(requests.map((url) => url.pathname), ['/api/v0/jobs/321']);
+});
+
+test('get_job returns a typed not_found when Accelo responds with HTTP 404', async (t) => {
+  const requests = mockJobReads(t, async (url) => {
+    assert.equal(url.pathname, '/api/v0/jobs/321');
+    return new Response(JSON.stringify({ meta: { message: 'Not found' } }), { status: 404 });
+  });
+
+  const result = await callTool('get_job', { job_id: '321' });
+
+  assert.deepEqual(result, { status: 'not_found', object_type: 'job' });
+  assert.equal(requests.length, 1);
+});
+
+test('get_job and get_project_plan expose job company references', async (t) => {
+  const job = {
+    id: '321',
+    title: 'Matter',
+    against: { id: '456' },
+    against_type: 'company',
+    against_id: '456',
+    company: { id: '456' },
+    standing: 'inactive',
+    job_status: 'job-status',
+    date_started: '1700000000',
+    date_completed: '1700000100',
+  };
+  mockJobReads(t, (url) => {
+    if (url.pathname === '/api/v0/jobs/321') return { response: job };
+    if (url.pathname === '/api/v0/jobs/321/milestones') return { response: [] };
+    if (url.pathname === '/api/v0/tasks') return { response: [] };
+    throw new Error(`Unexpected request: ${url.pathname}`);
+  });
+
+  const single = await callTool('get_job', { job_id: '321' });
+  const plan = await callTool('get_project_plan', { job_id: '321' });
+
+  assert.equal(single.against_type, 'company');
+  assert.equal(single.against_id, '456');
+  assert.equal(single.company_id, '456');
+  assert.equal(plan.job.against_type, 'company');
+  assert.equal(plan.job.against_id, '456');
+  assert.equal(plan.job.job_status, 'job-status');
+});
+
+test('project profile values distinguish definition and value IDs and allow field selection', async (t) => {
+  const requests = mockJobReads(t, (url) => {
+    assert.equal(url.searchParams.get('_fields'), 'id,value,field_id,field_name,field_type');
+    return { response: [
+      { id: '9001', field_id: '62', field_name: 'Project Folder', field_type: 'hyperlink', value: 'https://drive.example/one' },
+      { id: '9002', field_id: '63', field_name: 'Summary', field_type: 'text', value: 'summary' },
+    ] };
+  });
+
+  const values = await callTool('get_project_profile_values', { job_id: '321', field_id: '62' });
+
+  assert.equal(values.length, 1);
+  assert.equal(values[0].field_id, '62');
+  assert.equal(values[0].value_id, '9001');
+  assert.equal(values[0].id, '9001');
+  assert.notEqual(values[0].field_id, values[0].value_id);
+  assert.equal(requests.length, 1);
 });
