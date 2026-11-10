@@ -499,8 +499,8 @@ export function registerActivityTools(server, subject) {
           throw Object.assign(new Error('Accelo metadata request failed.'), { status: error.status });
         }
         const response = json?.response;
-        const rows = Array.isArray(response) ? response
-          : Array.isArray(response?.[key]) ? response[key]
+        const rows = Array.isArray(response?.[key]) ? response[key]
+          : Array.isArray(response) ? response
           : response && typeof response === 'object' && response.id != null ? [response] : null;
         const attempt = { path: attemptedPath, status: 200 };
         attempts.push(attempt);
@@ -520,7 +520,7 @@ export function registerActivityTools(server, subject) {
       try {
         collectionWindow = await fetchWindow(async (upstreamPage, size) => {
           return fetchMetadata(`/${against_type}s/${encodeURIComponent(against_id)}/collections`, {
-            _fields: 'id,title',
+            _fields: '_ALL',
             _limit: size,
             _page: upstreamPage,
           }, 'collections');

@@ -480,6 +480,7 @@ for (const shape of ['array', 'nested', 'single']) {
         const limit = Math.min(100, Number(url.searchParams.get('_limit')));
         assert.equal(limit, 100);
         if (url.pathname.endsWith('/collections')) {
+          assert.equal(url.searchParams.get('_fields'), '_ALL');
           return Response.json({ response: owner ? { unknown: 'private client data' } : wrap({ id: '7', title: 'Files' }, 'collections') });
         }
         assert.equal(url.searchParams.get('_filters'), owner ? 'owner_type(job),owner_id(20)' : 'collection_id(7)');
@@ -489,6 +490,8 @@ for (const shape of ['array', 'nested', 'single']) {
       assert.equal(result.attachments.length, 1);
       assert.equal(result.attachments[0].id, '9');
       assert.equal(result.attachments[0].filename, 'file.pdf');
+      assert.equal(result.attachments[0].collection_id, owner ? undefined : '7');
+      assert.equal(result.attachments[0].collection_title, owner ? undefined : 'Files');
       assert.equal(result.source, owner ? 'owner' : undefined);
       assert.equal(result.collections_gathered, owner ? 0 : 1);
       assert.equal(requests.length, 2);
@@ -496,6 +499,28 @@ for (const shape of ['array', 'nested', 'single']) {
     });
   }
 }
+
+test('list_matter_collections prioritizes the nested collections list for issues', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    if (url.pathname === '/api/v0/issues/20/collections') {
+      assert.equal(url.searchParams.get('_fields'), '_ALL');
+      return Response.json({ response: {
+        id: '20',
+        collections: [{ id: '7', title: 'Files' }].slice(0, limit),
+      } });
+    }
+    assert.equal(url.pathname, '/api/v0/resources');
+    assert.equal(url.searchParams.get('_filters'), 'collection_id(7)');
+    return Response.json({ response: [{ id: '9', filename: 'file.pdf' }].slice(0, limit) });
+  });
+  const result = await call('list_matter_collections', { against_type: 'issue', against_id: '20' });
+  assert.equal(result.collections_gathered, 1);
+  assert.equal(result.attachments[0].collection_id, '7');
+  assert.equal(result.attachments[0].collection_title, 'Files');
+  assert.equal(result.attachments[0].id, '9');
+});
 
 for (const response of [
   { unknown: 'private-client', filename: 'confidential.pdf' },
