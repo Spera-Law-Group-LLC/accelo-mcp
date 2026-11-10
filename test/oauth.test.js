@@ -996,7 +996,7 @@ test('registered confidential client completes PKCE authorization, callback, red
   const listed = await mcpRequest(issued.access_token, 'tools/list');
   assert.equal(listed.status, 200);
   const listedBody = await mcpJson(listed);
-  assert.equal(listedBody.result.tools.length, 31, 'dynamically registered LibreChat clients retain all tools');
+  assert.equal(listedBody.result.tools.length, 28, 'dynamically registered LibreChat clients retain all tools');
   assert.equal((await token(request)).status, 400);
   const refreshRequest = {
     grant_type: 'refresh_token', refresh_token: issued.refresh_token,
@@ -1035,7 +1035,7 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   assert.equal(fullClient.scope, 'full');
   const fullAccess = seedAccessToken(fullClient.client_id);
   const fullList = await mcpRequest(fullAccess, 'tools/list');
-  assert.equal((await mcpJson(fullList)).result.tools.length, 31);
+  assert.equal((await mcpJson(fullList)).result.tools.length, 28);
 
   const defaultResponse = await fetch(`${baseUrl}/register`, {
     method: 'POST',
@@ -1092,7 +1092,7 @@ test('read-only clients see only the 17 allowlisted tools and cannot call a writ
 test('legacy NULL-scope and dangling-client tokens resolve to the intended capabilities', async () => {
   const legacyAccess = seedAccessToken('legacy-client');
   const legacyList = await mcpRequest(legacyAccess, 'tools/list');
-  assert.equal((await mcpJson(legacyList)).result.tools.length, 31);
+  assert.equal((await mcpJson(legacyList)).result.tools.length, 28);
 
   const orphanAccess = seedAccessToken('deleted-client');
   const orphanList = await mcpRequest(orphanAccess, 'tools/list');
