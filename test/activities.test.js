@@ -70,6 +70,27 @@ async function call(name, args) {
   return JSON.parse((await tool.handler(args)).content[0].text);
 }
 
+function mockActivityWrite(t, parent = { id: 'parent-id', against_type: 'job', against_id: '123' }) {
+  const requests = [];
+  t.mock.method(globalThis, 'fetch', async (input, options = {}) => {
+    const url = new URL(input);
+    requests.push({ url, options });
+    if (url.pathname.endsWith('/activities/parent-id')) {
+      return Response.json({ response: parent });
+    }
+    if (url.pathname.endsWith('/activities') && options.method === 'POST') {
+      return Response.json({ response: { id: 'created-id' } });
+    }
+    if (url.pathname.endsWith('/activities/created-id')) {
+      return Response.json({
+        response: { id: 'created-id', ...Object.fromEntries(new URLSearchParams(options.body || '')) },
+      });
+    }
+    throw new Error(`Unexpected Accelo request: ${options.method || 'GET'} ${url.pathname}`);
+  });
+  return requests;
+}
+
 test('list_activities retrieves a >100-row history without gaps or duplicates', async (t) => {
   const rows = activities(305);
   const requests = mockAccelo(t, rows);
@@ -174,4 +195,97 @@ test('activity read schemas reject invalid pages and explain how to follow has_m
     assert.match(tool.description, /has_more/);
     assert.match(tool.description, /page \+ 1/);
   }
+});
+
+test('create_activity inherits the parent object for previews and confirmed writes', async (t) => {
+  const requests = mockActivityWrite(t);
+  const args = { parent_id: 'parent-id', subject: 'Reply', body: 'Reply body' };
+  const preview = await call('create_activity', args);
+  assert.equal(preview.status, 'confirmation_required');
+  assert.equal(preview.pending.against, 'job(123)');
+  assert.equal(requests.filter(({ options }) => options.method === 'POST').length, 0);
+
+  const result = await call('create_activity', { ...args, confirm: true });
+  assert.equal(result.status, 'created');
+  const post = requests.find(({ options }) => options.method === 'POST');
+  assert.ok(post);
+  const fields = Object.fromEntries(new URLSearchParams(post.options.body));
+  assert.equal(fields.against_type, 'job');
+  assert.equal(fields.against_id, '123');
+  assert.equal(fields.parent_id, 'parent-id');
+  assert.equal(fields.medium, 'note');
+});
+
+test('create_activity rejects an explicit against object that differs from its parent', async (t) => {
+  const requests = mockActivityWrite(t);
+  const result = await call('create_activity', {
+    parent_id: 'parent-id',
+    against_type: 'issue',
+    against_id: '123',
+    subject: 'Reply',
+    body: 'Reply body',
+    confirm: true,
+  });
+  assert.equal(result.status, 'error');
+  assert.match(result.message, /against_type does not match/i);
+  assert.equal(requests.filter(({ options }) => options.method === 'POST').length, 0);
+});
+
+test('create_activity requires an against pair when no parent activity is supplied', async (t) => {
+  const requests = mockActivityWrite(t);
+  const result = await call('create_activity', {
+    subject: 'Standalone note',
+    body: 'Note body',
+    confirm: true,
+  });
+  assert.equal(result.status, 'error');
+  assert.match(result.message, /against_type and against_id are required/i);
+  assert.equal(requests.length, 0);
+});
+
+test('create_activity uses the subject as body for time entries', async (t) => {
+  const requests = mockActivityWrite(t);
+  const args = {
+    against_type: 'issue',
+    against_id: '456',
+    subject: 'Review filing',
+    time_minutes: 15,
+  };
+  const preview = await call('create_activity', args);
+  assert.equal(preview.pending.body, args.subject);
+  const result = await call('create_activity', { ...args, confirm: true });
+  assert.equal(result.status, 'created');
+  const fields = Object.fromEntries(new URLSearchParams(
+    requests.find(({ options }) => options.method === 'POST').options.body,
+  ));
+  assert.equal(fields.body, args.subject);
+  assert.equal(fields.billable, '900');
+});
+
+test('log_note inherits parent, logs time, and cannot produce an email medium', async (t) => {
+  const requests = mockActivityWrite(t);
+  assert.equal(tools.get('log_note').schema.medium, undefined);
+  const result = await call('log_note', {
+    parent_id: 'parent-id',
+    subject: 'Review filing',
+    time_minutes: 20,
+    billable: false,
+    medium: 'email',
+    confirm: true,
+  });
+  assert.equal(result.status, 'created');
+  const fields = Object.fromEntries(new URLSearchParams(
+    requests.find(({ options }) => options.method === 'POST').options.body,
+  ));
+  assert.equal(fields.against_type, 'job');
+  assert.equal(fields.against_id, '123');
+  assert.equal(fields.parent_id, 'parent-id');
+  assert.equal(fields.medium, 'note');
+  assert.equal(fields.body, 'Review filing');
+  assert.equal(fields.nonbillable, '1200');
+});
+
+test('only create_activity and log_note are registered for writes', () => {
+  for (const name of ['create_activity', 'log_note']) assert.ok(tools.has(name));
+  for (const name of ['log_email', 'reply_to_activity', 'log_time']) assert.ok(!tools.has(name));
 });

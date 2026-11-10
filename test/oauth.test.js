@@ -1072,7 +1072,7 @@ test('read-only clients see only the 17 allowlisted tools and cannot call a writ
     assert.ok(names.includes(name), `${name} is registered for read-only clients`);
   }
   for (const name of [
-    'create_activity', 'log_note', 'log_email', 'reply_to_activity', 'log_time',
+    'create_activity', 'log_note',
     'create_quote', 'update_quote', 'trigger_quote_template', 'update_task',
     'create_task', 'update_milestone', 'reschedule_plan', 'progress_task', 'cancel_task',
   ]) {
