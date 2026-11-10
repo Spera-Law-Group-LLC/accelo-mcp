@@ -94,7 +94,6 @@ const READ_TOOLS = new Set([
 ]);
 
 export function scopedServer(server, scope) {
-  if (scope !== 'read_only') return server;
   return new Proxy(server, {
     get(target, prop, receiver) {
       if (prop !== 'tool') return Reflect.get(target, prop, receiver);
