@@ -338,15 +338,15 @@ test('list_matter_collections pages collections and tags resource metadata', asy
     const limit = Math.min(100, Number(url.searchParams.get('_limit')));
     assert.equal(limit, 100);
     if (url.pathname === '/api/v0/jobs/20/collections') {
-      return Response.json({ response: [{ id: 'collection-7', title: 'Matter Files' }].slice(0, limit) });
+      return Response.json({ response: [{ id: '7', title: 'Matter Files' }].slice(0, limit) });
     }
     assert.equal(url.pathname, '/api/v0/resources');
-    assert.equal(url.searchParams.get('_filters'), 'collection_id(collection-7)');
+    assert.equal(url.searchParams.get('_filters'), 'collection_id(7)');
     assert.ok(url.searchParams.get('_fields').split(',').includes('collection_id'));
     return Response.json({ response: [{
       id: 'resource-9', title: 'Pleading', filename: 'pleading.pdf',
       mime_type: 'application/pdf', filesize: '1200', date_created: '1700000000',
-      collection_id: 'collection-7',
+      collection_id: '7',
     }].slice(0, limit) });
   });
   const result = await call('list_matter_collections', {
@@ -359,7 +359,7 @@ test('list_matter_collections pages collections and tags resource metadata', asy
     mimetype: 'application/pdf',
     filesize: '1200',
     date_created: '1700000000',
-    collection_id: 'collection-7',
+    collection_id: '7',
     collection_title: 'Matter Files',
   });
   assert.equal(result.capped, false);
@@ -370,7 +370,7 @@ test('list_matter_collections pages collections and tags resource metadata', asy
 
 test('list_matter_collections discards mismatched collection rows and tries owner fallback', async (t) => {
   for (const [label, resource] of [
-    ['mismatched', { id: 'foreign-resource', collection_id: 'collection-8', filename: 'private.pdf' }],
+    ['mismatched', { id: 'foreign-resource', collection_id: '8', filename: 'private.pdf' }],
     ['missing', { id: 'foreign-resource', filename: 'private.pdf' }],
   ]) {
     await t.test(label, async (t) => {
@@ -378,9 +378,9 @@ test('list_matter_collections discards mismatched collection rows and tries owne
       t.mock.method(globalThis, 'fetch', async (input) => {
         const url = new URL(input);
         if (url.pathname === '/api/v0/jobs/20/collections') {
-          return Response.json({ response: [{ id: 'collection-7', title: 'Matter Files' }] });
+          return Response.json({ response: [{ id: '7', title: 'Matter Files' }] });
         }
-        if (url.searchParams.get('_filters') === 'collection_id(collection-7)') {
+        if (url.searchParams.get('_filters') === 'collection_id(7)') {
           return Response.json({ response: [resource] });
         }
         ownerFallbackRequested = true;
@@ -418,15 +418,34 @@ test('list_matter_collections fails closed when owner references are missing', a
   assert.equal(JSON.stringify(result).includes('private.pdf'), false);
 });
 
+test('list_matter_collections fails closed when owner references mismatch', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    if (url.pathname.endsWith('/collections')) {
+      return Response.json({ meta: { message: 'unsupported' } }, { status: 404 });
+    }
+    return Response.json({ response: [{
+      id: 'foreign-resource', owner_type: 'issue', owner_id: '20', filename: 'private.pdf',
+    }] });
+  });
+  const result = await call('list_matter_collections', { against_type: 'job', against_id: '20' });
+  assert.deepEqual(result.attempts, [
+    { path: '/jobs/20/collections', status: 404 },
+    { path: '/resources?_filters=owner_type(job),owner_id(20)', status: 200, mismatch_count: 1 },
+  ]);
+  assert.equal(result.attachments, undefined);
+  assert.equal(JSON.stringify(result).includes('private.pdf'), false);
+});
+
 test('list_matter_collections records scope mismatches without resource values', async (t) => {
   t.mock.method(globalThis, 'fetch', async (input) => {
     const url = new URL(input);
     if (url.pathname.endsWith('/collections')) {
-      return Response.json({ response: [{ id: 'collection-7' }] });
+      return Response.json({ response: [{ id: '7' }] });
     }
-    if (url.searchParams.get('_filters') === 'collection_id(collection-7)') {
+    if (url.searchParams.get('_filters') === 'collection_id(7)') {
       return Response.json({ response: [{
-        id: 'foreign-resource', collection_id: 'collection-8', filename: 'private.pdf',
+        id: 'foreign-resource', collection_id: '8', filename: 'private.pdf',
       }] });
     }
     return Response.json({ meta: { message: 'unsupported' } }, { status: 400 });
@@ -434,7 +453,7 @@ test('list_matter_collections records scope mismatches without resource values',
   const result = await call('list_matter_collections', { against_type: 'job', against_id: '20' });
   assert.deepEqual(result.attempts, [
     { path: '/jobs/20/collections', status: 200 },
-    { path: '/resources?_filters=collection_id(collection-7)', status: 200, mismatch_count: 1 },
+    { path: '/resources?_filters=collection_id(7)', status: 200, mismatch_count: 1 },
     { path: '/resources?_filters=owner_type(job),owner_id(20)', status: 400 },
   ]);
   assert.equal(result.attachments, undefined);
@@ -522,9 +541,11 @@ test('list_matter_collections does not fall back on denied access', async (t) =>
   let calls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     calls += 1;
-    return Response.json({ meta: { message: 'denied' } }, { status: 403 });
+    return Response.json({ meta: { message: 'denied private-client confidential.pdf' } }, { status: 403 });
   });
-  await assert.rejects(call('list_matter_collections', { against_type: 'job', against_id: '20' }), { status: 403 });
+  await assert.rejects(call('list_matter_collections', { against_type: 'job', against_id: '20' }), {
+    status: 403, message: 'Accelo metadata request failed.',
+  });
   assert.equal(calls, 1);
 });
 
@@ -574,6 +595,138 @@ test('list_matter_collections discloses the owner resource cap', async (t) => {
   assert.equal(result.attachments_gathered, 1000);
   assert.equal(result.attachment_cap, 1000);
 });
+
+for (const shape of ['array', 'nested', 'single']) {
+  for (const owner of [false, true]) {
+    test(`list_matter_collections accepts ${shape} responses via ${owner ? 'owner' : 'collections'}`, async (t) => {
+      const wrap = (row, key) => shape === 'array' ? [row] : shape === 'nested' ? { [key]: [row] } : row;
+      const requests = [];
+      t.mock.method(globalThis, 'fetch', async (input) => {
+        const url = new URL(input);
+        requests.push(url);
+        const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+        assert.equal(limit, 100);
+        if (url.pathname.endsWith('/collections')) {
+          assert.equal(url.searchParams.get('_fields'), '_ALL');
+          return Response.json({ response: owner ? { unknown: 'private client data' } : wrap({ id: '7', title: 'Files' }, 'collections') });
+        }
+        assert.equal(url.searchParams.get('_filters'), owner ? 'owner_type(job),owner_id(20)' : 'collection_id(7)');
+        const resource = owner
+          ? { id: '9', filename: 'file.pdf', owner_type: 'job', owner_id: '20' }
+          : { id: '9', filename: 'file.pdf', collection_id: '7' };
+        return Response.json({ response: wrap(resource, 'resources') });
+      });
+      const result = await call('list_matter_collections', { against_type: 'job', against_id: '20' });
+      assert.equal(result.attachments.length, 1);
+      assert.equal(result.attachments[0].id, '9');
+      assert.equal(result.attachments[0].filename, 'file.pdf');
+      assert.equal(result.attachments[0].collection_id, owner ? undefined : '7');
+      assert.equal(result.attachments[0].collection_title, owner ? undefined : 'Files');
+      assert.equal(result.source, owner ? 'owner' : undefined);
+      assert.equal(result.collections_gathered, owner ? 0 : 1);
+      assert.equal(requests.length, 2);
+      assert.equal(JSON.stringify(result).includes('private client data'), false);
+    });
+  }
+}
+
+test('list_matter_collections prioritizes the nested collections list for issues', async (t) => {
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    if (url.pathname === '/api/v0/issues/20/collections') {
+      assert.equal(url.searchParams.get('_fields'), '_ALL');
+      return Response.json({ response: {
+        id: '20',
+        collections: [{ id: '7', title: 'Files' }].slice(0, limit),
+      } });
+    }
+    assert.equal(url.pathname, '/api/v0/resources');
+    assert.equal(url.searchParams.get('_filters'), 'collection_id(7)');
+    return Response.json({ response: [{
+      id: '9', filename: 'file.pdf', collection_id: '7',
+    }].slice(0, limit) });
+  });
+  const result = await call('list_matter_collections', { against_type: 'issue', against_id: '20' });
+  assert.equal(result.collections_gathered, 1);
+  assert.equal(result.attachments[0].collection_id, '7');
+  assert.equal(result.attachments[0].collection_title, 'Files');
+  assert.equal(result.attachments[0].id, '9');
+});
+
+for (const response of [
+  { unknown: 'private-client', filename: 'confidential.pdf' },
+  null, 'confidential.pdf', 42, true,
+  { collections: { filename: 'confidential.pdf' } },
+  { id: 'confidential.pdf', title: 'private-client' },
+  [{ title: 'private-client' }],
+]) {
+  test(`list_matter_collections records invalid shape ${JSON.stringify(response)} and owner failure`, async (t) => {
+    const shape = response == null ? [] : Object.keys(response);
+    t.mock.method(globalThis, 'fetch', async (input) => {
+      const url = new URL(input);
+      assert.equal(Math.min(100, Number(url.searchParams.get('_limit'))), 100);
+      return Response.json({
+        response: url.pathname.endsWith('/collections') ? response : { filename: 'confidential.pdf', unknown: 'private-client' },
+      });
+    });
+    const result = await call('list_matter_collections', { against_type: 'issue', against_id: '20' });
+    assert.equal(result.error, 'collections_unavailable');
+    assert.deepEqual(result.attempts, [
+      { path: '/issues/20/collections', status: 200, shape },
+      { path: '/resources?_filters=owner_type(issue),owner_id(20)', status: 200, shape: ['filename', 'unknown'] },
+    ]);
+    assert.equal(result.attachments, undefined);
+    assert.equal(JSON.stringify(result).includes('private-client'), false);
+    assert.equal(JSON.stringify(result).includes('confidential.pdf'), false);
+  });
+}
+
+for (const ownerFails of [false, true]) {
+  test(`list_matter_collections retries invalid collection resources with owner failure=${ownerFails}`, async (t) => {
+    const requests = [];
+    t.mock.method(globalThis, 'fetch', async (input) => {
+      const url = new URL(input);
+      requests.push(url);
+      const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+      if (url.pathname.endsWith('/collections')) {
+        return Response.json({ response: [{ id: '1' }, { id: '2' }].slice(0, limit) });
+      }
+      if (url.searchParams.get('_filters') === 'collection_id(1)') {
+        return Response.json({ response: [{
+          id: '99', filename: 'partial.pdf', collection_id: '1',
+        }].slice(0, limit) });
+      }
+      if (url.searchParams.get('_filters') === 'collection_id(2)') {
+        return Response.json({ response: { unknown: 'private-client', filename: 'confidential.pdf' } });
+      }
+      if (ownerFails) {
+        return Response.json({ meta: { message: 'confidential.pdf private-client' } }, { status: 400 });
+      }
+      return Response.json({ response: { resources: [{
+        id: '3', filename: 'owner.pdf', owner_type: 'job', owner_id: '20',
+      }].slice(0, limit) } });
+    });
+    const result = await call('list_matter_collections', { against_type: 'job', against_id: '20' });
+    assert.equal(requests.length, 4);
+    if (ownerFails) {
+      assert.equal(result.error, 'collections_unavailable');
+      assert.deepEqual(result.attempts, [
+        { path: '/jobs/20/collections', status: 200 },
+        { path: '/resources?_filters=collection_id(1)', status: 200 },
+        { path: '/resources?_filters=collection_id(2)', status: 200, shape: ['unknown', 'filename'] },
+        { path: '/resources?_filters=owner_type(job),owner_id(20)', status: 400 },
+      ]);
+    } else {
+      assert.deepEqual(result.attachments.map((row) => row.id), ['3']);
+      assert.equal(result.source, 'owner');
+      assert.equal(result.collections_gathered, 0);
+    }
+    for (const value of ['partial.pdf', 'confidential.pdf', 'private-client']) {
+      assert.equal(JSON.stringify(result).includes(value), false);
+    }
+  });
+}
 
 test('create_activity inherits the parent object for previews and confirmed writes', async (t) => {
   const requests = mockActivityWrite(t);

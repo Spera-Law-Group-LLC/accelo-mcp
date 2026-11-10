@@ -121,7 +121,7 @@ export function registerCompanyTools(server, subject) {
 
   server.tool(
     'get_matter_contacts',
-    'Get the matter’s own client affiliation and a company-verified contact roster for a job or issue. Roster failures return roster_error; an unverified roster returns filter_not_applied without roster rows. The own affiliation is preserved in either case. Read-only.',
+    'Get the matter’s own client affiliation and a company-verified contact roster for a job or issue. Returns roster_filter on success or roster_error listing failed filters without roster rows. The own affiliation is always preserved. Read-only.',
     {
       against_type: z.enum(['job', 'issue']).describe('Matter type'),
       against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
@@ -181,7 +181,7 @@ export function registerCompanyTools(server, subject) {
         if (companyId == null) throw new Error('Matter affiliation has no resolvable company ID.');
         const fetchRoster = (filter) => fetchWindow(async (upstreamPage, size) => {
           const json = await acceloGet(token, '/affiliations', {
-            _filters: `${filter}(${companyId})`,
+            _filters: filter,
             _fields: fields,
             _limit: size,
             _page: upstreamPage,
@@ -194,24 +194,33 @@ export function registerCompanyTools(server, subject) {
           }
           return json.response;
         }, 100, 0);
-        let window;
-        try {
-          window = await fetchRoster('company_id');
-        } catch (error) {
-          if (error.status !== 400) throw error;
-          window = await fetchRoster('company');
+        const failures = [];
+        let mismatchCount;
+        for (const [name, filter] of [
+          ['company', `company(${companyId})`],
+          ['company_id', `company_id(${companyId})`],
+          ['against_type,against_id', `against_type(company),against_id(${companyId})`],
+        ]) {
+          try {
+            const window = await fetchRoster(filter);
+            result.contacts.push(...window.slice(0, 100)
+              .filter((row) => String(relationId(row)) !== String(ownAffiliationId))
+              .map(toContact));
+            result.has_more = window.length > 100;
+            result.roster_filter = name;
+            return ok(result);
+          } catch (error) {
+            failures.push(`${filter}: ${error.mismatch_count ? `mismatch:${error.mismatch_count}` : error.status ?? 'error'}`);
+            mismatchCount = error.mismatch_count ?? mismatchCount;
+          }
         }
-        result.contacts.push(...window.slice(0, 100)
-          .filter((row) => String(relationId(row)) !== String(ownAffiliationId))
-          .map(toContact));
-        result.has_more = window.length > 100;
-      } catch (error) {
-        if (error.mismatch_count) {
+        result.roster_error = failures.join('; ');
+        if (mismatchCount) {
           result.status = 'filter_not_applied';
-          result.mismatch_count = error.mismatch_count;
-        } else {
-          result.roster_error = `${error.status ?? 'error'} ${error.message}`;
+          result.mismatch_count = mismatchCount;
         }
+      } catch (error) {
+        result.roster_error = `${error.status ?? 'error'} Matter affiliation has no resolvable company roster.`;
       }
       return ok(result);
     }

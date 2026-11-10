@@ -523,25 +523,34 @@ export function registerActivityTools(server, subject) {
       const attachmentCap = 1000;
 
       const attempts = [];
-      const fetchMetadata = async (path, query, scope) => {
+      const fetchMetadata = async (path, query, key, scope) => {
         const attemptedPath = query._filters ? `${path}?_filters=${query._filters}` : path;
         let json;
         try {
           json = await acceloGet(token, path, query);
         } catch (error) {
           attempts.push({ path: attemptedPath, status: error.status ?? null });
-          throw error;
+          throw Object.assign(new Error('Accelo metadata request failed.'), { status: error.status });
         }
+        const response = json?.response;
+        const rows = Array.isArray(response?.[key]) ? response[key]
+          : Array.isArray(response) ? response
+          : response && typeof response === 'object' && response.id != null ? [response] : null;
         const attempt = { path: attemptedPath, status: 200 };
         attempts.push(attempt);
-        if (scope && Array.isArray(json.response)) {
-          const mismatchCount = resourceScopeMismatchCount(json.response, scope);
+        if (!rows || rows.some((row) => !row || typeof row !== 'object' || row.id == null ||
+          (key === 'collections' && !/^\d+$/.test(String(row.id))))) {
+          attempt.shape = response == null ? [] : Object.keys(response);
+          throw Object.assign(new Error('Accelo metadata returned an invalid response shape.'), { status: 200 });
+        }
+        if (scope) {
+          const mismatchCount = resourceScopeMismatchCount(rows, scope);
           if (mismatchCount) {
             attempt.mismatch_count = mismatchCount;
-            throw new ResourceScopeMismatchError(mismatchCount);
+            throw Object.assign(new ResourceScopeMismatchError(mismatchCount), { status: 200 });
           }
         }
-        return json;
+        return rows;
       };
       let collectionWindow = [];
       let attachments = [];
@@ -551,28 +560,23 @@ export function registerActivityTools(server, subject) {
 
       try {
         collectionWindow = await fetchWindow(async (upstreamPage, size) => {
-          const json = await fetchMetadata(`/${against_type}s/${encodeURIComponent(against_id)}/collections`, {
-            _fields: 'id,title',
+          return fetchMetadata(`/${against_type}s/${encodeURIComponent(against_id)}/collections`, {
+            _fields: '_ALL',
             _limit: size,
             _page: upstreamPage,
-          });
-          if (!Array.isArray(json.response)) throw new Error('Accelo matter collections returned an invalid response.');
-          return json.response;
+          }, 'collections');
         }, collectionCap, 0);
         const collections = collectionWindow.slice(0, collectionCap);
         for (const collection of collections) {
           collectionsProcessed += 1;
           const collectionId = collection.id;
-          if (collectionId == null) throw new Error('Accelo collection response is missing an ID.');
           const resourceWindow = await fetchWindow(async (upstreamPage, size) => {
-            const json = await fetchMetadata('/resources', {
+            return fetchMetadata('/resources', {
               _filters: `collection_id(${collectionId})`,
               _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,collection_id',
               _limit: size,
               _page: upstreamPage,
-            }, [{ field: 'collection_id', value: collectionId }]);
-            if (!Array.isArray(json.response)) throw new Error('Accelo collection resources returned an invalid response.');
-            return json.response;
+            }, 'resources', [{ field: 'collection_id', value: collectionId }]);
           }, Math.min(100, attachmentCap - attachments.length), 0);
           const collectionResources = resourceWindow.slice(0, 100);
           if (resourceWindow.length > collectionResources.length) resourceCapped = true;
@@ -599,20 +603,18 @@ export function registerActivityTools(server, subject) {
           }
         }
       } catch (error) {
-        if (error.status !== 400 && error.status !== 404 && !(error instanceof ResourceScopeMismatchError)) throw error;
+        if (error.status !== 200 && error.status !== 400 && error.status !== 404) throw error;
         try {
           const window = await fetchWindow(async (upstreamPage, size) => {
-            const json = await fetchMetadata('/resources', {
+            return fetchMetadata('/resources', {
               _filters: `owner_type(${against_type}),owner_id(${against_id})`,
               _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,owner_type,owner_id',
               _limit: size,
               _page: upstreamPage,
-            }, [
+            }, 'resources', [
               { field: 'owner_type', value: against_type },
               { field: 'owner_id', value: against_id },
             ]);
-            if (!Array.isArray(json.response)) throw new Error('Accelo owner resources returned an invalid response.');
-            return json.response;
           }, attachmentCap, 0);
           attachments = window.slice(0, attachmentCap).map((resource) => ({
             id: resource.id,
@@ -627,7 +629,7 @@ export function registerActivityTools(server, subject) {
           collectionWindow = [];
           collectionsProcessed = 0;
           source = 'owner';
-        } catch (ownerError) {
+        } catch {
           return ok({
             status: 'error',
             error: 'collections_unavailable',
