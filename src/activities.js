@@ -474,6 +474,92 @@ export function registerActivityTools(server, subject) {
     }
   );
 
+  server.tool(
+    'list_matter_collections',
+    'List metadata for files uploaded directly to a job or issue. Returns resource rows tagged with collection ID and title. Does not download file contents. Fan-out is capped and disclosed; when has_more is true, request page + 1 with the same limit. Read-only.',
+    {
+      against_type: z.enum(['job', 'issue']).describe('Matter type'),
+      against_id: z.string().regex(/^\d+$/, 'against_id must be a numeric ID').describe('Numeric matter ID'),
+      limit: z.number().int().min(1).max(100).optional().describe('Max results per page (default 50)'),
+      page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
+    },
+    async ({ against_type, against_id, limit = 50, page = 0 }) => {
+      const token = await getValidAcceloToken(subject);
+      const collectionCap = 100;
+      const attachmentCap = 1000;
+
+      // The collections filter shape is a candidate and must be verified live; keep any unsupported/4xx response visible.
+      const collectionWindow = await fetchWindow(async (upstreamPage, size) => {
+        const json = await acceloGet(token, '/collections', {
+          _filters: `against_type(${against_type}),against_id(${against_id})`,
+          _fields: 'id,title',
+          _limit: size,
+          _page: upstreamPage,
+        });
+        if (!Array.isArray(json.response)) throw new Error('Accelo matter collections returned an invalid response.');
+        return json.response;
+      }, collectionCap, 0);
+      const collections = collectionWindow.slice(0, collectionCap);
+      const attachments = [];
+      let resourceCapped = false;
+      let collectionsProcessed = 0;
+
+      for (const collection of collections) {
+        collectionsProcessed += 1;
+        const collectionId = collection.id;
+        if (collectionId == null) throw new Error('Accelo collection response is missing an ID.');
+        const resourceWindow = await fetchWindow(async (upstreamPage, size) => {
+          const json = await acceloGet(token, '/resources', {
+            _filters: `collection_id(${collectionId})`,
+            _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created',
+            _limit: size,
+            _page: upstreamPage,
+          });
+          if (!Array.isArray(json.response)) throw new Error('Accelo collection resources returned an invalid response.');
+          return json.response;
+        }, Math.min(100, attachmentCap - attachments.length), 0);
+        const collectionResources = resourceWindow.slice(0, 100);
+        if (resourceWindow.length > collectionResources.length) resourceCapped = true;
+        for (const resource of collectionResources) {
+          if (attachments.length >= attachmentCap) {
+            resourceCapped = true;
+            break;
+          }
+          attachments.push({
+            id: resource.id,
+            title: resource.title,
+            filename: resource.filename,
+            mimetype: resource.mimetype ?? resource.mime_type,
+            filesize: resource.filesize,
+            date_created: resource.date_created,
+            collection_id: String(collectionId),
+            collection_title: collection.title ?? null,
+          });
+        }
+        if (attachments.length >= attachmentCap) {
+          resourceCapped ||= resourceWindow.length > collectionResources.length ||
+            collectionsProcessed < collections.length || collectionWindow.length > collectionCap;
+          break;
+        }
+      }
+
+      const collectionCapped = collectionWindow.length > collectionCap;
+      const capped = collectionCapped || resourceCapped;
+      const start = page * limit;
+      return ok({
+        attachments: attachments.slice(start, start + limit),
+        page,
+        limit,
+        has_more: attachments.length > start + limit || capped,
+        capped,
+        collections_gathered: collectionsProcessed,
+        attachments_gathered: attachments.length,
+        collection_cap: collectionCap,
+        attachment_cap: attachmentCap,
+      });
+    }
+  );
+
   // -------- Writes (confirm:true-guarded) --------
   server.tool(
     'create_activity',

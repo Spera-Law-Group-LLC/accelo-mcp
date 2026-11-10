@@ -90,6 +90,7 @@ const READ_TOOLS = new Set([
   'get_matter_contacts',
   'list_activity_attachments',
   'list_matter_attachments',
+  'list_matter_collections',
 ]);
 
 export function scopedServer(server, scope) {
