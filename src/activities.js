@@ -309,6 +309,27 @@ function buildActivityBody({
   return out;
 }
 
+async function resolveActivityAgainst(token, args) {
+  if (args.parent_id) {
+    const parent = (await acceloGet(token, `/activities/${encodeURIComponent(args.parent_id)}`, {
+      _fields: 'id,against_type,against_id',
+    })).response;
+    if (!parent) return { error: `Parent activity ${args.parent_id} not found.` };
+    if (args.against_type !== undefined &&
+        mapAgainstType(args.against_type) !== mapAgainstType(parent.against_type)) {
+      return { error: 'against_type does not match the parent activity.' };
+    }
+    if (args.against_id !== undefined && String(args.against_id) !== String(parent.against_id)) {
+      return { error: 'against_id does not match the parent activity.' };
+    }
+    return { against_type: parent.against_type, against_id: parent.against_id };
+  }
+  if (!args.against_type || !args.against_id) {
+    return { error: 'against_type and against_id are required unless parent_id is provided.' };
+  }
+  return { against_type: args.against_type, against_id: args.against_id };
+}
+
 // Build a preview object for the confirm step (human-readable).
 function previewOf(b) {
   return {
@@ -392,10 +413,10 @@ export function registerActivityTools(server, subject) {
   // -------- Writes (confirm:true-guarded) --------
   server.tool(
     'create_activity',
-    'Create (push) an activity into Accelo against an object. WRITE OPERATION: requires confirm:true; first call previews, second call with confirm:true applies. medium = note (internal) or email (can target external affiliations). Optional time_minutes logs time (billable by default). Optional parent_id threads this as a reply. Defaults: visibility "all", class 13 (Pushed from LibreChat). Owner is the authenticated user.',
+    'Create (push) a note, email, reply, or time entry in Accelo. WRITE OPERATION: requires confirm:true; first call previews, second call with confirm:true applies. medium = note (internal) or email (can target external affiliations). Optional time_minutes logs time (billable by default). Optional parent_id threads this as a reply and inherits the parent activity’s against object. Defaults: medium note, visibility "all", class 13 (Pushed from LibreChat). Owner is the authenticated user.',
     {
-      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
-      against_id: z.string().describe('ID of the parent object'),
+      against_type: z.string().optional().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact; optional with parent_id'),
+      against_id: z.string().optional().describe('ID of the parent object; optional with parent_id'),
       subject: z.string().describe('Activity subject (required by Accelo)'),
       body: z.string().optional().describe('Plaintext body (use html_body for rich email)'),
       html_body: z.string().optional().describe('HTML body (for emails)'),
@@ -410,108 +431,45 @@ export function registerActivityTools(server, subject) {
     },
     async (args) => {
       if (!args.subject) return ok({ status: 'error', message: 'subject is required.' });
-      if (args.body === undefined && args.html_body === undefined) {
+      const body = args.body === undefined && args.html_body === undefined && args.time_minutes !== undefined
+        ? args.subject
+        : args.body;
+      if (body === undefined && args.html_body === undefined) {
         return ok({ status: 'error', message: 'Provide body or html_body.' });
       }
-      const b = buildActivityBody(args);
+      const token = args.parent_id ? await getValidAcceloToken(subject) : null;
+      const against = await resolveActivityAgainst(token, args);
+      if (against.error) return ok({ status: 'error', message: against.error });
+      const b = buildActivityBody({ ...args, ...against, body });
       if (args.confirm !== true) return needsConfirmation('CREATE an activity', previewOf(b));
-      const token = await getValidAcceloToken(subject);
-      return ok({ status: 'created', activity: await createActivity(token, b) });
+      return ok({ status: 'created', activity: await createActivity(token || await getValidAcceloToken(subject), b) });
     }
   );
 
   server.tool(
     'log_note',
-    'Convenience tool: log an internal NOTE against an Accelo object. WRITE OPERATION: requires confirm:true (preview first). Notes are internal and never sent externally. Optional time_minutes logs time. Defaults: visibility "all", class 13 (Pushed from LibreChat).',
+    'Log an internal NOTE against an Accelo object. WRITE OPERATION: requires confirm:true (preview first). Notes are internal and never sent externally. Optional parent_id threads a reply and inherits the parent activity’s against object; optional time_minutes logs time. Defaults: visibility "all", class 13 (Pushed from LibreChat).',
     {
-      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
-      against_id: z.string().describe('ID of the parent object'),
+      against_type: z.string().optional().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact; optional with parent_id'),
+      against_id: z.string().optional().describe('ID of the parent object; optional with parent_id'),
+      parent_id: z.string().optional().describe('Parent activity ID to thread this note as a reply'),
       subject: z.string().describe('Note subject'),
-      body: z.string().describe('Note body (plaintext)'),
+      body: z.string().optional().describe('Note body (plaintext); defaults to subject when logging time'),
       time_minutes: z.number().optional().describe('Time to log, in minutes'),
       billable: z.boolean().optional().describe('true=billable (default), false=nonbillable'),
       confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview only.'),
     },
     async (args) => {
-      const b = buildActivityBody({ ...args, medium: 'note' });
-      if (args.confirm !== true) return needsConfirmation('LOG a note', previewOf(b));
-      const token = await getValidAcceloToken(subject);
-      return ok({ status: 'created', activity: await createActivity(token, b) });
-    }
-  );
-
-  server.tool(
-    'log_email',
-    'Convenience tool: log an EMAIL activity against an Accelo object. WRITE OPERATION: requires confirm:true (preview first). Unlike a note, an email medium can be associated with external affiliations. Provide html_body for rich content. Defaults: visibility "all", class 13 (Pushed from LibreChat). NOTE: actual outbound send behavior depends on the Accelo deployment; verify recipients before confirming.',
-    {
-      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
-      against_id: z.string().describe('ID of the parent object'),
-      subject: z.string().describe('Email subject'),
-      html_body: z.string().optional().describe('HTML email body'),
-      body: z.string().optional().describe('Plaintext email body (if not using html_body)'),
-      time_minutes: z.number().optional().describe('Time to log, in minutes'),
-      billable: z.boolean().optional().describe('true=billable (default), false=nonbillable'),
-      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview only.'),
-    },
-    async (args) => {
-      if (args.body === undefined && args.html_body === undefined) {
-        return ok({ status: 'error', message: 'Provide body or html_body.' });
+      if (args.body === undefined && args.time_minutes === undefined) {
+        return ok({ status: 'error', message: 'Provide body or time_minutes.' });
       }
-      const b = buildActivityBody({ ...args, medium: 'email' });
-      if (args.confirm !== true) return needsConfirmation('LOG an email', previewOf(b));
-      const token = await getValidAcceloToken(subject);
-      return ok({ status: 'created', activity: await createActivity(token, b) });
-    }
-  );
-
-  server.tool(
-    'reply_to_activity',
-    'Reply to an existing Accelo activity, threading the reply under it. WRITE OPERATION: requires confirm:true (preview first). Inherits the parent activity\'s against object. medium defaults to note. Defaults: visibility "all", class 13 (Pushed from LibreChat).',
-    {
-      parent_id: z.string().describe('The activity ID to reply to'),
-      subject: z.string().describe('Reply subject'),
-      body: z.string().describe('Reply body (plaintext)'),
-      medium: z.enum(['note', 'email']).optional().describe('note (default) or email'),
-      time_minutes: z.number().optional().describe('Time to log, in minutes'),
-      billable: z.boolean().optional().describe('true=billable (default), false=nonbillable'),
-      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview only.'),
-    },
-    async (args) => {
-      const token = await getValidAcceloToken(subject);
-      const parent = (await acceloGet(token, `/activities/${encodeURIComponent(args.parent_id)}`, { _fields: 'id,against_type,against_id' })).response;
-      if (!parent) return ok({ status: 'error', message: `Parent activity ${args.parent_id} not found.` });
-      const b = buildActivityBody({
-        ...args,
-        against_type: parent.against_type,
-        against_id: parent.against_id,
-        medium: args.medium || 'note',
-      });
-      if (args.confirm !== true) return needsConfirmation(`REPLY to activity ${args.parent_id}`, previewOf(b));
-      return ok({ status: 'created', activity: await createActivity(token, b) });
-    }
-  );
-
-  server.tool(
-    'log_time',
-    'Log a time entry against an Accelo object as a note activity. WRITE OPERATION: requires confirm:true (preview first). Use this to record how long work (e.g. a LibreChat session) took: pass time_minutes. The AGENT should compute time_minutes from the conversation (first to last message timestamps) and tell the user the math before confirming. Defaults: billable, visibility "all", class 13 (Pushed from LibreChat).',
-    {
-      against_type: z.string().describe('Parent type: job or issue (a matter), or task, milestone, deal, quote, company, contact'),
-      against_id: z.string().describe('ID of the parent object'),
-      subject: z.string().describe('What the time was for'),
-      time_minutes: z.number().describe('Minutes of time to log'),
-      body: z.string().optional().describe('Optional detail of the work done'),
-      billable: z.boolean().optional().describe('true=billable (default), false=nonbillable'),
-      confirm: z.boolean().optional().describe('Must be true to apply. Omit/false to preview only.'),
-    },
-    async (args) => {
-      const b = buildActivityBody({
-        ...args,
-        body: args.body !== undefined ? args.body : args.subject,
-        medium: 'note',
-      });
-      if (args.confirm !== true) return needsConfirmation(`LOG ${args.time_minutes} minutes`, previewOf(b));
-      const token = await getValidAcceloToken(subject);
-      return ok({ status: 'created', activity: await createActivity(token, b) });
+      const token = args.parent_id ? await getValidAcceloToken(subject) : null;
+      const against = await resolveActivityAgainst(token, args);
+      if (against.error) return ok({ status: 'error', message: against.error });
+      const body = args.body === undefined ? args.subject : args.body;
+      const b = buildActivityBody({ ...args, ...against, body, medium: 'note' });
+      if (args.confirm !== true) return needsConfirmation('LOG a note', previewOf(b));
+      return ok({ status: 'created', activity: await createActivity(token || await getValidAcceloToken(subject), b) });
     }
   );
 }
