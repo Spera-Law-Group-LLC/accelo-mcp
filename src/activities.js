@@ -95,7 +95,7 @@ function verifyActivityResourceScope(rows, activityId) {
       if (activity != null && typeof activity === 'object' && Object.hasOwn(activity, 'id')) {
         references.push(matchesId(activity.id));
       } else if (typeof activity === 'string') {
-        references.push(matchesId(activity.match(/(?:^|\/)(\d+)$/)?.[1]));
+        references.push(matchesId(activity.match(/^(?:activities\/)?(\d+)$/i)?.[1]));
       }
     }
     if (has('owner')) {
