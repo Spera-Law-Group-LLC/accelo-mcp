@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -236,7 +236,7 @@ test('list_activity_attachments uses the production activity filter and maps met
     const url = new URL(input);
     requests.push(url);
     assert.equal(url.pathname, '/api/v0/resources');
-    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+    if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
       assert.equal(url.searchParams.get('_limit'), '1');
       assert.equal(url.searchParams.get('_fields'), 'id');
       return Response.json({ response: [] });
@@ -274,7 +274,7 @@ test('activity attachment tools fail closed on unsuccessful probes and retry wit
             return Response.json({ response: [{ id: '77' }] });
           }
           const limit = Math.min(100, Number(url.searchParams.get('_limit')));
-          if (url.searchParams.get('_filters') === 'activity_id(0)') {
+          if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
             probes += 1;
             assert.equal(options.method, 'GET');
             const token = db.prepare('SELECT access_token FROM accelo_tokens WHERE subject = ?').get('test-subject');
@@ -326,13 +326,23 @@ test('successful activity filter probes are shared across fan-out, expire after 
     if (url.pathname === '/api/v0/activities') {
       return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
     }
-    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+    if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
       probes += 1;
       return Response.json({ response: [] });
     }
     return Response.json({ response: [{ id: 'resource-1', collection_id: '9', owner_type: 'staff' }].slice(0, limit) });
   });
+  const { access_token: token } = db.prepare('SELECT access_token FROM accelo_tokens WHERE subject = ?').get('test-subject');
+  const cacheKeys = [];
+  const originalSet = Map.prototype.set;
+  const cacheSet = t.mock.method(Map.prototype, 'set', function (key, value) {
+    if (value === now + 10 * 60 * 1000) cacheKeys.push(key);
+    return originalSet.call(this, key, value);
+  });
   const result = await call('list_matter_attachments', { against_type: 'job', against_id: '20' });
+  cacheSet.mock.restore();
+  assert.deepEqual(cacheKeys, [createHash('sha256').update(token).digest('hex')]);
+  assert.ok(!cacheKeys.includes(token));
   assert.equal(result.attachments.length, 5);
   assert.equal(result.scope_verification, 'filter_probe');
   assert.equal(probes, 1);
@@ -392,7 +402,7 @@ test('activity attachment tools verify supported references and fail closed', as
           if (url.pathname === '/api/v0/activities') {
             return Response.json({ response: [{ id: '77' }].slice(page * limit, (page + 1) * limit) });
           }
-          if (url.searchParams.get('_filters') === 'activity_id(0)') {
+          if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
             return Response.json({ response: [] });
           }
           assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
@@ -430,7 +440,7 @@ test('activity attachment tools discard previously gathered rows on later scope 
         if (url.pathname === '/api/v0/activities') {
           return Response.json({ response: [{ id: '77' }, { id: '78' }].slice(page * limit, (page + 1) * limit) });
         }
-        if (url.searchParams.get('_filters') === 'activity_id(0)') {
+        if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
           return Response.json({ response: [] });
         }
         const activityId = url.searchParams.get('_filters') === 'activity_id(77)' ? '77' : '78';
@@ -467,7 +477,7 @@ test('list_matter_attachments tags files and reports the activity fan-out cap', 
       });
     }
     assert.equal(url.pathname, '/api/v0/resources');
-    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+    if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
       return Response.json({ response: [] });
     }
     assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
@@ -486,7 +496,7 @@ test('list_matter_attachments tags files and reports the activity fan-out cap', 
   assert.equal(result.capped, false);
   assert.equal(result.scope_verification, 'filter_probe');
   assert.ok(requests.every((url) => url.searchParams.get('_limit') ===
-    (url.searchParams.get('_filters') === 'activity_id(0)' ? '1' : '100')));
+    (url.searchParams.get('_filters') === 'activity_id(2147483647)' ? '1' : '100')));
 
   const manyActivities = Array.from({ length: 101 }, (_, index) => ({
     id: String(index + 1), subject: 'Synthetic activity', date_logged: '1700000000',
@@ -515,7 +525,7 @@ test('list_matter_attachments fails closed when a resource does not match its ac
     if (url.pathname === '/api/v0/activities') {
       return Response.json({ response: [{ id: '77', subject: 'Client call' }] });
     }
-    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+    if (url.searchParams.get('_filters') === 'activity_id(2147483647)') {
       return Response.json({ response: [] });
     }
     return Response.json({ response: [{ id: 'resource-1', activity_id: '78', filename: 'private.pdf' }] });

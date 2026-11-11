@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { getValidAcceloToken } from './oauth.js';
 import { fetchWindow } from './pagination.js';
 import { acceloGet, acceloPost } from './accelo.js';
@@ -78,14 +79,17 @@ class ResourceScopeUnverifiableError extends Error {
 
 const activityFilterProbeExpiry = new Map();
 const ACTIVITY_FILTER_PROBE_TTL_MS = 10 * 60 * 1000;
+// Avoid 0, which Accelo may short-circuit as a sentinel instead of filtering.
+const ACTIVITY_FILTER_PROBE_ID = 2147483647;
 
 async function verifyActivityResourceFilter(token) {
-  if (activityFilterProbeExpiry.get(token) > Date.now()) return;
+  const cacheKey = createHash('sha256').update(token).digest('hex');
+  if (activityFilterProbeExpiry.get(cacheKey) > Date.now()) return;
   for (const [key, expiry] of activityFilterProbeExpiry) {
     if (expiry <= Date.now()) activityFilterProbeExpiry.delete(key);
   }
   const json = await acceloGet(token, '/resources', {
-    _filters: 'activity_id(0)',
+    _filters: `activity_id(${ACTIVITY_FILTER_PROBE_ID})`,
     _limit: 1,
     _fields: 'id',
   });
@@ -93,7 +97,7 @@ async function verifyActivityResourceFilter(token) {
     throw new ResourceScopeUnverifiableError([json?.response ?? json]);
   }
   if (json.response.length) throw new ResourceScopeMismatchError(json.response.length);
-  activityFilterProbeExpiry.set(token, Date.now() + ACTIVITY_FILTER_PROBE_TTL_MS);
+  activityFilterProbeExpiry.set(cacheKey, Date.now() + ACTIVITY_FILTER_PROBE_TTL_MS);
 }
 
 function verifyActivityResourceScope(rows, activityId) {
