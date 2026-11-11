@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHash } from 'node:crypto';
 import { getValidAcceloToken } from './oauth.js';
 import { fetchWindow } from './pagination.js';
 import { acceloGet, acceloPost } from './accelo.js';
@@ -76,9 +77,31 @@ class ResourceScopeUnverifiableError extends Error {
   }
 }
 
+const activityFilterProbeExpiry = new Map();
+const ACTIVITY_FILTER_PROBE_TTL_MS = 10 * 60 * 1000;
+// Avoid 0, which Accelo may short-circuit as a sentinel instead of filtering.
+const ACTIVITY_FILTER_PROBE_ID = 2147483647;
+
+async function verifyActivityResourceFilter(token) {
+  const cacheKey = createHash('sha256').update(token).digest('hex');
+  if (activityFilterProbeExpiry.get(cacheKey) > Date.now()) return;
+  for (const [key, expiry] of activityFilterProbeExpiry) {
+    if (expiry <= Date.now()) activityFilterProbeExpiry.delete(key);
+  }
+  const json = await acceloGet(token, '/resources', {
+    _filters: `activity_id(${ACTIVITY_FILTER_PROBE_ID})`,
+    _limit: 1,
+    _fields: 'id',
+  });
+  if (!Array.isArray(json?.response)) {
+    throw new ResourceScopeUnverifiableError([json?.response ?? json]);
+  }
+  if (json.response.length) throw new ResourceScopeMismatchError(json.response.length);
+  activityFilterProbeExpiry.set(cacheKey, Date.now() + ACTIVITY_FILTER_PROBE_TTL_MS);
+}
+
 function verifyActivityResourceScope(rows, activityId) {
   let mismatchCount = 0;
-  let unverifiable = false;
   for (const row of rows) {
     const has = (key) => row != null && Object.hasOwn(row, key);
     const matchesId = (id) => id != null && String(id) === String(activityId);
@@ -107,10 +130,8 @@ function verifyActivityResourceScope(rows, activityId) {
       }
     }
     if (references.some((matches) => !matches)) mismatchCount += 1;
-    else if (!references.length) unverifiable = true;
   }
   if (mismatchCount) throw new ResourceScopeMismatchError(mismatchCount);
-  if (unverifiable) throw new ResourceScopeUnverifiableError(rows);
 }
 
 // Friendly parent names -> Accelo API against_type values. Accelo calls deals
@@ -282,6 +303,7 @@ async function fetchActivities(token, againstType, againstId, { medium, limit = 
 }
 
 async function fetchActivityAttachments(token, activityId) {
+  await verifyActivityResourceFilter(token);
   const window = await fetchWindow(async (upstreamPage, size) => {
     const json = await acceloGet(token, '/resources', {
       _filters: `activity_id(${activityId})`,
@@ -294,6 +316,7 @@ async function fetchActivityAttachments(token, activityId) {
     return json.response;
   }, 100, 0);
   return {
+    scope_verification: 'filter_probe',
     attachments: window.slice(0, 100).map((row) => ({
       id: row.id,
       title: row.title,
@@ -459,6 +482,7 @@ export function registerActivityTools(server, subject) {
       const token = await getValidAcceloToken(subject);
       let window;
       try {
+        await verifyActivityResourceFilter(token);
         window = await fetchWindow(async (upstreamPage, size) => {
           const json = await acceloGet(token, '/resources', {
             _filters: `activity_id(${activity_id})`,
@@ -488,7 +512,7 @@ export function registerActivityTools(server, subject) {
         date_created: row.date_created,
         activity_id: row.activity_id ?? activity_id,
       }));
-      return ok({ activity_id, attachments, page, limit, has_more: window.length > limit });
+      return ok({ activity_id, attachments, page, limit, has_more: window.length > limit, scope_verification: 'filter_probe' });
     }
   );
 
@@ -542,6 +566,7 @@ export function registerActivityTools(server, subject) {
       const start = page * limit;
       return ok({
         attachments: attachments.slice(start, start + limit),
+        scope_verification: 'filter_probe',
         page,
         limit,
         has_more: attachments.length > start + limit || capped,
