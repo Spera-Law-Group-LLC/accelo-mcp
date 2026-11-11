@@ -3,7 +3,7 @@ import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { after, test } from 'node:test';
+import { after, beforeEach, test } from 'node:test';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'accelo-mcp-activities-'));
 process.env.PUBLIC_BASE_URL = 'http://127.0.0.1';
@@ -18,6 +18,11 @@ const [{ registerActivityTools }, { default: db }] = await Promise.all([
 
 db.prepare('INSERT INTO accelo_tokens (subject, access_token, expires_at, created_at) VALUES (?,?,?,?)')
   .run('test-subject', randomBytes(24).toString('base64url'), Date.now() + 3600000, Date.now());
+
+beforeEach(() => {
+  db.prepare('UPDATE accelo_tokens SET access_token = ? WHERE subject = ?')
+    .run(randomBytes(24).toString('base64url'), 'test-subject');
+});
 
 const tools = new Map();
 registerActivityTools({
@@ -231,6 +236,11 @@ test('list_activity_attachments uses the production activity filter and maps met
     const url = new URL(input);
     requests.push(url);
     assert.equal(url.pathname, '/api/v0/resources');
+    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+      assert.equal(url.searchParams.get('_limit'), '1');
+      assert.equal(url.searchParams.get('_fields'), 'id');
+      return Response.json({ response: [] });
+    }
     assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
     assert.equal(url.searchParams.get('_fields'), '_ALL');
     const limit = Math.min(100, Number(url.searchParams.get('_limit')));
@@ -248,7 +258,94 @@ test('list_activity_attachments uses the production activity filter and maps met
   assert.equal(result.attachments[0].mimetype, 'application/pdf');
   assert.equal(result.attachments[0].activity_id, '77');
   assert.equal(result.has_more, false);
-  assert.equal(requests.length, 1);
+  assert.equal(result.scope_verification, 'filter_probe');
+  assert.equal(requests.length, 2);
+});
+
+test('activity attachment tools fail closed on unsuccessful probes and retry without caching', async (t) => {
+  for (const tool of ['list_activity_attachments', 'list_matter_attachments']) {
+    for (const outcome of ['row', 400, 500, 'malformed', 'invalid JSON', 'network error']) {
+      await t.test(`${tool}: ${outcome}`, async (t) => {
+        let probes = 0;
+        let resourceReads = 0;
+        t.mock.method(globalThis, 'fetch', async (input, options) => {
+          const url = new URL(input);
+          if (url.pathname === '/api/v0/activities') {
+            return Response.json({ response: [{ id: '77' }] });
+          }
+          const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+          if (url.searchParams.get('_filters') === 'activity_id(0)') {
+            probes += 1;
+            assert.equal(options.method, 'GET');
+            const token = db.prepare('SELECT access_token FROM accelo_tokens WHERE subject = ?').get('test-subject');
+            assert.equal(options.headers.Authorization.split(' ')[1], token.access_token);
+            assert.equal(limit, 1);
+            assert.equal(url.searchParams.get('_fields'), 'id');
+            if (probes > 1) return Response.json({ response: [] });
+            if (outcome === 'row') return Response.json({ response: [{ id: 'private-resource' }].slice(0, limit) });
+            if (outcome === 'malformed') return Response.json({ response: { unknown: 'private-value' } });
+            if (outcome === 'invalid JSON') return new Response('not JSON');
+            if (outcome === 'network error') throw new Error('Probe network failure');
+            return Response.json({ meta: { message: 'Probe rejected' } }, { status: outcome });
+          }
+          resourceReads += 1;
+          return Response.json({ response: [{ id: 'resource-1', owner_type: 'staff', owner_id: '2' }].slice(0, limit) });
+        });
+        const args = tool === 'list_activity_attachments'
+          ? { activity_id: '77' }
+          : { against_type: 'job', against_id: '20' };
+        if (typeof outcome === 'number') {
+          await assert.rejects(call(tool, args), (error) => error.status === outcome);
+        } else if (outcome === 'network error') {
+          await assert.rejects(call(tool, args), /Probe network failure/);
+        } else {
+          assert.deepEqual(await call(tool, args), outcome === 'row'
+            ? { status: 'filter_not_applied', mismatch_count: 1 }
+            : { status: 'scope_unverifiable', reference_keys_seen: [outcome === 'malformed' ? 'unknown' : 'raw'] });
+        }
+        assert.equal(resourceReads, 0);
+        const result = await call(tool, args);
+        assert.equal(result.scope_verification, 'filter_probe');
+        assert.equal(result.attachments.length, 1);
+        assert.equal(probes, 2);
+        assert.equal(resourceReads, 1);
+      });
+    }
+  }
+});
+
+test('successful activity filter probes are shared across fan-out, expire after ten minutes, and are token-scoped', async (t) => {
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  let probes = 0;
+  const rows = activities(5);
+  t.mock.method(globalThis, 'fetch', async (input) => {
+    const url = new URL(input);
+    const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+    const page = Number(url.searchParams.get('_page'));
+    if (url.pathname === '/api/v0/activities') {
+      return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+    }
+    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+      probes += 1;
+      return Response.json({ response: [] });
+    }
+    return Response.json({ response: [{ id: 'resource-1', collection_id: '9', owner_type: 'staff' }].slice(0, limit) });
+  });
+  const result = await call('list_matter_attachments', { against_type: 'job', against_id: '20' });
+  assert.equal(result.attachments.length, 5);
+  assert.equal(result.scope_verification, 'filter_probe');
+  assert.equal(probes, 1);
+  now += 10 * 60 * 1000 - 1;
+  await call('list_activity_attachments', { activity_id: '77' });
+  assert.equal(probes, 1);
+  now += 1;
+  await call('list_activity_attachments', { activity_id: '77' });
+  assert.equal(probes, 2);
+  db.prepare('UPDATE accelo_tokens SET access_token = ? WHERE subject = ?')
+    .run(randomBytes(24).toString('base64url'), 'test-subject');
+  await call('list_activity_attachments', { activity_id: '77' });
+  assert.equal(probes, 3);
 });
 
 test('activity attachment tools verify supported references and fail closed', async (t) => {
@@ -266,13 +363,13 @@ test('activity attachment tools verify supported references and fail closed', as
     ['unrelated against with matching activity', [{ activity_id: '77', against_type: 'job', against_id: '20' }], null],
     ['mismatched activity', [{ activity_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
     ['mismatched owner', [{ owner_type: 'activity', owner_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
-    ['wrong type', [{ against_type: 'job', against_id: '77' }], { status: 'scope_unverifiable', reference_keys_seen: ['against_id', 'against_type', 'filename', 'id'] }],
-    ['partial reference', [{ owner_id: '77' }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner_id'] }],
-    ['staff owner', [{ owner_type: 'staff', owner_id: '2' }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner_id', 'owner_type'] }],
-    ['staff owner string', [{ owner: 'staff/2' }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner'] }],
-    ['staff owner object', [{ owner: { type: 'staff', id: '2' } }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner'] }],
-    ['untyped nested owner', [{ owner: { id: '77' } }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner'] }],
-    ['activity object without id', [{ activity: {} }], { status: 'scope_unverifiable', reference_keys_seen: ['activity', 'filename', 'id'] }],
+    ['wrong type', [{ against_type: 'job', against_id: '77' }], null],
+    ['partial reference', [{ owner_id: '77' }], null],
+    ['staff owner', [{ owner_type: 'staff', owner_id: '2' }], null],
+    ['staff owner string', [{ owner: 'staff/2' }], null],
+    ['staff owner object', [{ owner: { type: 'staff', id: '2' } }], null],
+    ['untyped nested owner', [{ owner: { id: '77' } }], null],
+    ['activity object without id', [{ activity: {} }], null],
     ['activity type without id', [{ owner_type: 'activity' }], { status: 'filter_not_applied', mismatch_count: 1 }],
     ['nested mismatch', [{ activity: { id: '78' } }], { status: 'filter_not_applied', mismatch_count: 1 }],
     ['activity string mismatch', [{ activity: 'activities/78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
@@ -282,9 +379,7 @@ test('activity attachment tools verify supported references and fail closed', as
     ['against mismatch', [{ against_type: 'activity', against_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
     ['multiple mismatches', [{ activity_id: '78' }, { owner: { type: 'activity', id: '79' } }], { status: 'filter_not_applied', mismatch_count: 2 }],
     ['conflicting references', [{ activity_id: '77', owner_type: 'activity', owner_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
-    ['missing references', [{ extra: 'sensitive' }, { another: 'sensitive' }], {
-      status: 'scope_unverifiable', reference_keys_seen: ['another', 'extra', 'filename', 'id'],
-    }],
+    ['missing references', [{ extra: 'sensitive' }, { another: 'sensitive' }], null],
     ['mismatch takes precedence', [{ activity_id: '78' }, {}], { status: 'filter_not_applied', mismatch_count: 1 }],
   ];
   for (const tool of ['list_activity_attachments', 'list_matter_attachments']) {
@@ -296,6 +391,9 @@ test('activity attachment tools verify supported references and fail closed', as
           const page = Number(url.searchParams.get('_page'));
           if (url.pathname === '/api/v0/activities') {
             return Response.json({ response: [{ id: '77' }].slice(page * limit, (page + 1) * limit) });
+          }
+          if (url.searchParams.get('_filters') === 'activity_id(0)') {
+            return Response.json({ response: [] });
           }
           assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
           assert.equal(url.searchParams.get('_fields'), '_ALL');
@@ -313,6 +411,7 @@ test('activity attachment tools verify supported references and fail closed', as
           assert.equal(JSON.stringify(result).includes('private.pdf'), false);
           assert.equal(JSON.stringify(result).includes('sensitive'), false);
         } else {
+          assert.equal(result.scope_verification, 'filter_probe');
           assert.equal(result.attachments.length, references.length);
           assert.ok(result.attachments.every((row) => String(row.activity_id) === '77'));
         }
@@ -331,20 +430,23 @@ test('activity attachment tools discard previously gathered rows on later scope 
         if (url.pathname === '/api/v0/activities') {
           return Response.json({ response: [{ id: '77' }, { id: '78' }].slice(page * limit, (page + 1) * limit) });
         }
+        if (url.searchParams.get('_filters') === 'activity_id(0)') {
+          return Response.json({ response: [] });
+        }
         const activityId = url.searchParams.get('_filters') === 'activity_id(77)' ? '77' : '78';
         const rows = tool === 'list_activity_attachments'
           ? [...Array.from({ length: 100 }, () => ({ activity_id: '77', filename: 'private.pdf' })),
-            { id: 'unverified', filename: 'private.pdf' }]
+            { id: 'conflicting', activity_id: '78', filename: 'private.pdf' }]
           : activityId === '77'
             ? [{ activity_id: '77', filename: 'private.pdf' }]
-            : [{ id: 'unverified', filename: 'private.pdf' }];
+            : [{ id: 'conflicting', activity_id: '77', filename: 'private.pdf' }];
         return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
       });
       const args = tool === 'list_activity_attachments'
         ? { activity_id: '77', limit: 100 }
         : { against_type: 'job', against_id: '20' };
       assert.deepEqual(await call(tool, args), {
-        status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id'],
+        status: 'filter_not_applied', mismatch_count: 1,
       });
     });
   }
@@ -365,6 +467,9 @@ test('list_matter_attachments tags files and reports the activity fan-out cap', 
       });
     }
     assert.equal(url.pathname, '/api/v0/resources');
+    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+      return Response.json({ response: [] });
+    }
     assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
     assert.equal(url.searchParams.get('_fields'), '_ALL');
     return Response.json({ response: [{
@@ -379,7 +484,9 @@ test('list_matter_attachments tags files and reports the activity fan-out cap', 
   assert.equal(result.attachments[0].activity_subject, 'Client call');
   assert.ok(result.attachments[0].date_logged);
   assert.equal(result.capped, false);
-  assert.ok(requests.every((url) => url.searchParams.get('_limit') === '100'));
+  assert.equal(result.scope_verification, 'filter_probe');
+  assert.ok(requests.every((url) => url.searchParams.get('_limit') ===
+    (url.searchParams.get('_filters') === 'activity_id(0)' ? '1' : '100')));
 
   const manyActivities = Array.from({ length: 101 }, (_, index) => ({
     id: String(index + 1), subject: 'Synthetic activity', date_logged: '1700000000',
@@ -407,6 +514,9 @@ test('list_matter_attachments fails closed when a resource does not match its ac
     const url = new URL(input);
     if (url.pathname === '/api/v0/activities') {
       return Response.json({ response: [{ id: '77', subject: 'Client call' }] });
+    }
+    if (url.searchParams.get('_filters') === 'activity_id(0)') {
+      return Response.json({ response: [] });
     }
     return Response.json({ response: [{ id: 'resource-1', activity_id: '78', filename: 'private.pdf' }] });
   });
