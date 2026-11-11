@@ -82,16 +82,29 @@ function verifyActivityResourceScope(rows, activityId) {
   for (const row of rows) {
     const has = (key) => row != null && Object.hasOwn(row, key);
     const matchesId = (id) => id != null && String(id) === String(activityId);
+    const isActivity = (type) => typeof type === 'string' && type.toLowerCase() === 'activity';
     const references = [];
     if (has('activity_id')) references.push(matchesId(row.activity_id));
     for (const prefix of ['owner', 'against']) {
-      if (has(`${prefix}_type`) || has(`${prefix}_id`)) {
-        references.push(typeof row[`${prefix}_type`] === 'string' &&
-          row[`${prefix}_type`].toLowerCase() === 'activity' && matchesId(row[`${prefix}_id`]));
+      if (has(`${prefix}_type`) && isActivity(row[`${prefix}_type`])) {
+        references.push(matchesId(row[`${prefix}_id`]));
       }
     }
-    for (const key of ['activity', 'owner']) {
-      if (has(key)) references.push(row[key] != null && typeof row[key] === 'object' && matchesId(row[key].id));
+    if (has('activity')) {
+      const activity = row.activity;
+      if (activity != null && typeof activity === 'object' && Object.hasOwn(activity, 'id')) {
+        references.push(matchesId(activity.id));
+      } else if (typeof activity === 'string') {
+        references.push(matchesId(activity.match(/(?:^|\/)(\d+)$/)?.[1]));
+      }
+    }
+    if (has('owner')) {
+      const owner = row.owner;
+      if (owner != null && typeof owner === 'object' && isActivity(owner.type)) {
+        references.push(matchesId(owner.id));
+      } else if (typeof owner === 'string' && /^activities\//i.test(owner)) {
+        references.push(matchesId(owner.match(/^activities\/(\d+)$/i)?.[1]));
+      }
     }
     if (references.some((matches) => !matches)) mismatchCount += 1;
     else if (!references.length) unverifiable = true;
