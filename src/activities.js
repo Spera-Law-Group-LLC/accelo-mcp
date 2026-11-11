@@ -68,9 +68,49 @@ function resourceScopeMismatchCount(rows, scope) {
     row[field] == null || String(row[field]) !== String(value))).length;
 }
 
-function verifyResourceScope(rows, scope) {
-  const mismatchCount = resourceScopeMismatchCount(rows, scope);
+class ResourceScopeUnverifiableError extends Error {
+  constructor(rows) {
+    super('Accelo resource ownership could not be verified.');
+    this.referenceKeysSeen = [...new Set(rows.flatMap((row) =>
+      row && typeof row === 'object' ? Object.keys(row) : []))].sort();
+  }
+}
+
+function verifyActivityResourceScope(rows, activityId) {
+  let mismatchCount = 0;
+  let unverifiable = false;
+  for (const row of rows) {
+    const has = (key) => row != null && Object.hasOwn(row, key);
+    const matchesId = (id) => id != null && String(id) === String(activityId);
+    const isActivity = (type) => typeof type === 'string' && type.toLowerCase() === 'activity';
+    const references = [];
+    if (has('activity_id')) references.push(matchesId(row.activity_id));
+    for (const prefix of ['owner', 'against']) {
+      if (has(`${prefix}_type`) && isActivity(row[`${prefix}_type`])) {
+        references.push(matchesId(row[`${prefix}_id`]));
+      }
+    }
+    if (has('activity')) {
+      const activity = row.activity;
+      if (activity != null && typeof activity === 'object' && Object.hasOwn(activity, 'id')) {
+        references.push(matchesId(activity.id));
+      } else if (typeof activity === 'string') {
+        references.push(matchesId(activity.match(/^(?:activities\/)?(\d+)$/i)?.[1]));
+      }
+    }
+    if (has('owner')) {
+      const owner = row.owner;
+      if (owner != null && typeof owner === 'object' && isActivity(owner.type)) {
+        references.push(matchesId(owner.id));
+      } else if (typeof owner === 'string' && /^activities\//i.test(owner)) {
+        references.push(matchesId(owner.match(/^activities\/(\d+)$/i)?.[1]));
+      }
+    }
+    if (references.some((matches) => !matches)) mismatchCount += 1;
+    else if (!references.length) unverifiable = true;
+  }
   if (mismatchCount) throw new ResourceScopeMismatchError(mismatchCount);
+  if (unverifiable) throw new ResourceScopeUnverifiableError(rows);
 }
 
 // Friendly parent names -> Accelo API against_type values. Accelo calls deals
@@ -245,12 +285,12 @@ async function fetchActivityAttachments(token, activityId) {
   const window = await fetchWindow(async (upstreamPage, size) => {
     const json = await acceloGet(token, '/resources', {
       _filters: `activity_id(${activityId})`,
-      _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,activity_id',
+      _fields: '_ALL',
       _limit: size,
       _page: upstreamPage,
     });
     if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
-    verifyResourceScope(json.response, [{ field: 'activity_id', value: activityId }]);
+    verifyActivityResourceScope(json.response, activityId);
     return json.response;
   }, 100, 0);
   return {
@@ -409,7 +449,7 @@ export function registerActivityTools(server, subject) {
 
   server.tool(
     'list_activity_attachments',
-    'List attachment metadata for one Accelo activity. Does not download file contents. Returns filter_not_applied without rows if Accelo returns resources outside the requested activity. Pages are zero-based; when has_more is true, request page + 1 with the same limit. Read-only.',
+    'List attachment metadata for one Accelo activity. Does not download file contents. Returns filter_not_applied or scope_unverifiable without rows if resource ownership does not match or cannot be verified. Pages are zero-based; when has_more is true, request page + 1 with the same limit. Read-only.',
     {
       activity_id: z.string().regex(/^\d+$/, 'activity_id must be a numeric ID').describe('Numeric activity ID'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results per page (default 50)'),
@@ -422,17 +462,20 @@ export function registerActivityTools(server, subject) {
         window = await fetchWindow(async (upstreamPage, size) => {
           const json = await acceloGet(token, '/resources', {
             _filters: `activity_id(${activity_id})`,
-            _fields: 'id,title,filename,mimetype,mime_type,filesize,date_created,activity_id',
+            _fields: '_ALL',
             _limit: size,
             _page: upstreamPage,
           });
           if (!Array.isArray(json.response)) throw new Error('Accelo activity attachments returned an invalid response.');
-          verifyResourceScope(json.response, [{ field: 'activity_id', value: activity_id }]);
+          verifyActivityResourceScope(json.response, activity_id);
           return json.response;
         }, limit, page);
       } catch (error) {
         if (error instanceof ResourceScopeMismatchError) {
           return ok({ status: 'filter_not_applied', mismatch_count: error.mismatchCount });
+        }
+        if (error instanceof ResourceScopeUnverifiableError) {
+          return ok({ status: 'scope_unverifiable', reference_keys_seen: error.referenceKeysSeen });
         }
         throw error;
       }
@@ -488,6 +531,9 @@ export function registerActivityTools(server, subject) {
       } catch (error) {
         if (error instanceof ResourceScopeMismatchError) {
           return ok({ status: 'filter_not_applied', mismatch_count: error.mismatchCount });
+        }
+        if (error instanceof ResourceScopeUnverifiableError) {
+          return ok({ status: 'scope_unverifiable', reference_keys_seen: error.referenceKeysSeen });
         }
         throw error;
       }

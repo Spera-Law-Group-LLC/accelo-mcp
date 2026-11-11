@@ -232,7 +232,7 @@ test('list_activity_attachments uses the production activity filter and maps met
     requests.push(url);
     assert.equal(url.pathname, '/api/v0/resources');
     assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
-    assert.ok(url.searchParams.get('_fields').split(',').includes('activity_id'));
+    assert.equal(url.searchParams.get('_fields'), '_ALL');
     const limit = Math.min(100, Number(url.searchParams.get('_limit')));
     assert.equal(limit, 100);
     return Response.json({
@@ -251,16 +251,101 @@ test('list_activity_attachments uses the production activity filter and maps met
   assert.equal(requests.length, 1);
 });
 
-test('list_activity_attachments fails closed for mismatched or missing activity ownership', async (t) => {
-  for (const [label, resource] of [
-    ['mismatched', { id: 'resource-1', activity_id: '78', filename: 'private.pdf' }],
-    ['missing', { id: 'resource-1', filename: 'private.pdf' }],
-  ]) {
-    await t.test(label, async (t) => {
-      t.mock.method(globalThis, 'fetch', async () => Response.json({ response: [resource] }));
-      const result = await call('list_activity_attachments', { activity_id: '77' });
-      assert.deepEqual(result, { status: 'filter_not_applied', mismatch_count: 1 });
-      assert.equal(JSON.stringify(result).includes('private.pdf'), false);
+test('activity attachment tools verify supported references and fail closed', async (t) => {
+  const cases = [
+    ['activity_id', [{ activity_id: 77 }], null],
+    ['owner', [{ owner_type: 'AcTiViTy', owner_id: 77 }], null],
+    ['against', [{ against_type: 'ACTIVITY', against_id: '77' }], null],
+    ['nested activity', [{ activity: { id: 77 } }], null],
+    ['activity string', [{ activity: 'activities/77' }], null],
+    ['activity string numeric', [{ activity: '77' }], null],
+    ['activity string case insensitive', [{ activity: 'ACTIVITIES/77' }], null],
+    ['nested owner', [{ owner: { type: 'Activity', id: '77' } }], null],
+    ['owner string', [{ owner: 'activities/77' }], null],
+    ['unrelated owner with matching activity', [{ activity_id: '77', owner_type: 'staff', owner_id: '2', owner: 'staff/2' }], null],
+    ['unrelated against with matching activity', [{ activity_id: '77', against_type: 'job', against_id: '20' }], null],
+    ['mismatched activity', [{ activity_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['mismatched owner', [{ owner_type: 'activity', owner_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['wrong type', [{ against_type: 'job', against_id: '77' }], { status: 'scope_unverifiable', reference_keys_seen: ['against_id', 'against_type', 'filename', 'id'] }],
+    ['partial reference', [{ owner_id: '77' }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner_id'] }],
+    ['staff owner', [{ owner_type: 'staff', owner_id: '2' }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner_id', 'owner_type'] }],
+    ['staff owner string', [{ owner: 'staff/2' }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner'] }],
+    ['staff owner object', [{ owner: { type: 'staff', id: '2' } }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner'] }],
+    ['untyped nested owner', [{ owner: { id: '77' } }], { status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id', 'owner'] }],
+    ['activity object without id', [{ activity: {} }], { status: 'scope_unverifiable', reference_keys_seen: ['activity', 'filename', 'id'] }],
+    ['activity type without id', [{ owner_type: 'activity' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['nested mismatch', [{ activity: { id: '78' } }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['activity string mismatch', [{ activity: 'activities/78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['activity string wrong prefix', [{ activity: 'jobs/77' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['owner string mismatch', [{ owner: 'activities/78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['owner string malformed', [{ owner: 'activities/not-a-number' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['against mismatch', [{ against_type: 'activity', against_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['multiple mismatches', [{ activity_id: '78' }, { owner: { type: 'activity', id: '79' } }], { status: 'filter_not_applied', mismatch_count: 2 }],
+    ['conflicting references', [{ activity_id: '77', owner_type: 'activity', owner_id: '78' }], { status: 'filter_not_applied', mismatch_count: 1 }],
+    ['missing references', [{ extra: 'sensitive' }, { another: 'sensitive' }], {
+      status: 'scope_unverifiable', reference_keys_seen: ['another', 'extra', 'filename', 'id'],
+    }],
+    ['mismatch takes precedence', [{ activity_id: '78' }, {}], { status: 'filter_not_applied', mismatch_count: 1 }],
+  ];
+  for (const tool of ['list_activity_attachments', 'list_matter_attachments']) {
+    for (const [label, references, expected] of cases) {
+      await t.test(`${tool}: ${label}`, async (t) => {
+        t.mock.method(globalThis, 'fetch', async (input) => {
+          const url = new URL(input);
+          const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+          const page = Number(url.searchParams.get('_page'));
+          if (url.pathname === '/api/v0/activities') {
+            return Response.json({ response: [{ id: '77' }].slice(page * limit, (page + 1) * limit) });
+          }
+          assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
+          assert.equal(url.searchParams.get('_fields'), '_ALL');
+          const rows = references.map((reference, index) => ({
+            id: `resource-${index}`, filename: 'private.pdf', ...reference,
+          }));
+          return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+        });
+        const args = tool === 'list_activity_attachments'
+          ? { activity_id: '77' }
+          : { against_type: 'job', against_id: '20' };
+        const result = await call(tool, args);
+        if (expected) {
+          assert.deepEqual(result, expected);
+          assert.equal(JSON.stringify(result).includes('private.pdf'), false);
+          assert.equal(JSON.stringify(result).includes('sensitive'), false);
+        } else {
+          assert.equal(result.attachments.length, references.length);
+          assert.ok(result.attachments.every((row) => String(row.activity_id) === '77'));
+        }
+      });
+    }
+  }
+});
+
+test('activity attachment tools discard previously gathered rows on later scope failures', async (t) => {
+  for (const tool of ['list_activity_attachments', 'list_matter_attachments']) {
+    await t.test(tool, async (t) => {
+      t.mock.method(globalThis, 'fetch', async (input) => {
+        const url = new URL(input);
+        const limit = Math.min(100, Number(url.searchParams.get('_limit')));
+        const page = Number(url.searchParams.get('_page'));
+        if (url.pathname === '/api/v0/activities') {
+          return Response.json({ response: [{ id: '77' }, { id: '78' }].slice(page * limit, (page + 1) * limit) });
+        }
+        const activityId = url.searchParams.get('_filters') === 'activity_id(77)' ? '77' : '78';
+        const rows = tool === 'list_activity_attachments'
+          ? [...Array.from({ length: 100 }, () => ({ activity_id: '77', filename: 'private.pdf' })),
+            { id: 'unverified', filename: 'private.pdf' }]
+          : activityId === '77'
+            ? [{ activity_id: '77', filename: 'private.pdf' }]
+            : [{ id: 'unverified', filename: 'private.pdf' }];
+        return Response.json({ response: rows.slice(page * limit, (page + 1) * limit) });
+      });
+      const args = tool === 'list_activity_attachments'
+        ? { activity_id: '77', limit: 100 }
+        : { against_type: 'job', against_id: '20' };
+      assert.deepEqual(await call(tool, args), {
+        status: 'scope_unverifiable', reference_keys_seen: ['filename', 'id'],
+      });
     });
   }
 });
@@ -281,7 +366,7 @@ test('list_matter_attachments tags files and reports the activity fan-out cap', 
     }
     assert.equal(url.pathname, '/api/v0/resources');
     assert.equal(url.searchParams.get('_filters'), 'activity_id(77)');
-    assert.ok(url.searchParams.get('_fields').split(',').includes('activity_id'));
+    assert.equal(url.searchParams.get('_fields'), '_ALL');
     return Response.json({ response: [{
       id: 'resource-1', title: 'Engagement', filename: 'engagement.pdf', mimetype: 'application/pdf',
       activity_id: '77',
