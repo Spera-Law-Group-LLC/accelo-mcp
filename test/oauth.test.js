@@ -783,7 +783,7 @@ test('authorize renders consent without reaching Accelo and defaults the stored 
   assert.equal(response.headers.get('location'), null);
   assert.equal(response.headers.get('content-type'), 'text/html; charset=utf-8');
   assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.equal(response.headers.get('content-security-policy'), "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'");
+  assert.equal(response.headers.get('content-security-policy'), `default-src 'none'; base-uri 'none'; form-action 'self' http://127.0.0.1:${upstream.address().port} https://client.example; frame-ancestors 'none'; style-src 'unsafe-inline'`);
   assert.equal(response.headers.get('x-frame-options'), 'DENY');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('referrer-policy'), 'no-referrer');
@@ -794,13 +794,42 @@ test('authorize renders consent without reaching Accelo and defaults the stored 
   assert.ok(!html.includes(clientId), 'opaque client id is not shown to the user');
   assert.ok(html.indexOf('value="deny"') < html.indexOf('value="approve"'), 'Deny is the first form action');
   assert.match(html, /class="deny"[^>]*>Deny/);
-  assert.match(html, /\.deny\s*\{[^}]*font-weight:\s*700/s);
-  assert.match(html, /\.approve\s*\{[^}]*text-decoration:\s*underline/s);
+  assert.match(html, /<meta name="color-scheme" content="light">/);
+  assert.match(html, /body\s*\{[^}]*background:\s*#fff;[^}]*color:\s*#111;/s);
+  assert.match(html, /form\s*\{[^}]*align-items:\s*stretch/s);
+  assert.match(html, /button\s*\{[^}]*border:\s*1px solid #24364b;[^}]*border-radius:\s*\.3rem;[^}]*font-weight:\s*700;[^}]*padding:\s*\.9rem 1\.4rem;/s);
+  assert.match(html, /<button class="approve"[^>]*>Continue to Accelo<\/button>/);
+  assert.ok(!html.includes('text-decoration: underline'));
   const row = db.prepare('SELECT * FROM consent_requests').get();
   assert.equal(row.code_challenge, challenge);
   assert.equal(row.code_challenge_method, 'S256');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM auth_state').get().count, 0);
 });
+
+for (const clientRedirect of [
+  'https://word.speralaw.com:8443/callback?next=https://untrusted.example/',
+  'http://localhost:3080/callback',
+]) {
+  test(`consent form-action allows only configured OAuth and selected stored redirect origins for ${clientRedirect}`, async () => {
+    db.prepare('UPDATE clients SET redirect_uris = ? WHERE client_id = ?')
+      .run(JSON.stringify([redirectUri, clientRedirect]), clientId);
+    const params = new URLSearchParams({
+      response_type: 'code', client_id: clientId, redirect_uri: clientRedirect,
+      code_challenge: challenge, code_challenge_method: 'S256',
+    });
+    const response = await fetch(`${baseUrl}/authorize?${params}`, {
+      headers: { Origin: 'https://untrusted.example', 'X-Forwarded-Host': 'untrusted.example' },
+      redirect: 'manual',
+    });
+    assert.equal(response.status, 200);
+    const formAction = response.headers.get('content-security-policy')
+      .split(';').map((directive) => directive.trim()).find((directive) => directive.startsWith('form-action '));
+    assert.deepEqual(formAction.split(/\s+/).slice(1), [
+      "'self'", `http://127.0.0.1:${upstream.address().port}`, new URL(clientRedirect).origin,
+    ]);
+    assert.equal(db.prepare('SELECT client_redirect_uri FROM consent_requests').get().client_redirect_uri, clientRedirect);
+  });
+}
 
 test('hostile redirect URI registered through POST is not rendered as markup', async () => {
   const localRedirect = 'http://localhost:3080/cb';
