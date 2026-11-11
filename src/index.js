@@ -132,14 +132,14 @@ app.post('/register', registerLimiter, (req, res) => {
 function renderConsentPage(consentId, redirectOrigin, createdAt) {
   return `<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Authorization request</title>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><title>Authorization request</title>
 <style>
-  body { font: 16px system-ui, sans-serif; margin: 0; padding: 2rem; }
+  body { background: #fff; color: #111; font: 16px system-ui, sans-serif; margin: 0; padding: 2rem; }
   main { margin: 0 auto; max-width: 36rem; }
-  form { display: flex; flex-direction: column; align-items: flex-start; gap: 1rem; margin-top: 2rem; }
-  button { cursor: pointer; font: inherit; }
-  .deny { background: #24364b; border: 0; border-radius: .3rem; color: white; font-weight: 700; padding: .9rem 1.4rem; }
-  .approve { background: none; border: 0; color: #24364b; padding: .5rem 0; text-decoration: underline; }
+  form { display: flex; flex-direction: column; align-items: stretch; gap: 1rem; margin-top: 2rem; }
+  button { border: 1px solid #24364b; border-radius: .3rem; cursor: pointer; font: inherit; font-weight: 700; padding: .9rem 1.4rem; }
+  .deny { background: #24364b; color: white; }
+  .approve { background: #fff; color: #24364b; }
 </style>
 </head>
 <body>
@@ -159,10 +159,12 @@ function renderConsentPage(consentId, redirectOrigin, createdAt) {
 </html>`;
 }
 
-function setConsentHeaders(res) {
+function setConsentHeaders(res, redirectOrigin) {
+  // Form-submission redirects need both server-determined destinations, not arbitrary request origins.
+  const acceloOrigin = new URL(config.acceloOAuthUrl).origin;
   res.set({
     'Cache-Control': 'no-store',
-    'Content-Security-Policy': "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; style-src 'unsafe-inline'",
+    'Content-Security-Policy': `default-src 'none'; base-uri 'none'; form-action 'self' ${acceloOrigin} ${redirectOrigin}; frame-ancestors 'none'; style-src 'unsafe-inline'`,
     'Referrer-Policy': 'no-referrer',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
@@ -211,14 +213,14 @@ app.get('/authorize', authorizeLimiter, (req, res) => {
     return res.status(400).send('invalid_request');
   }
 
-  const redirectOrigin = redirectUriOrigin(redirect_uri);
+  const redirectOrigin = redirectUriOrigin(registered.find((uri) => uri === redirect_uri));
   if (!redirectOrigin) return res.status(400).send('redirect_uri_mismatch');
   const consentId = rand(24);
   db.prepare(
     'INSERT INTO consent_requests (consent_id, client_id, client_redirect_uri, client_state, code_challenge, code_challenge_method, created_at) VALUES (?,?,?,?,?,?,?)'
   ).run(consentId, client_id, redirect_uri, state || null, code_challenge, code_challenge_method || 'S256', now());
 
-  setConsentHeaders(res);
+  setConsentHeaders(res, redirectOrigin);
   res.type('html').status(200).send(renderConsentPage(consentId, redirectOrigin, client.created_at));
 });
 
