@@ -739,6 +739,20 @@ test('registration success and rejection logs pass the registry-report secret se
   }
 });
 
+test('dynamic registration rejects CSP punctuation in redirect hosts', async () => {
+  for (const redirectUri of [
+    'https://evil.com;attacker.example/cb',
+    'https://evil.com"attacker.example/cb',
+    "https://evil.com'attacker.example/cb",
+    'https://evil.com,attacker.example/cb',
+    'https://evil.com；script-src/cb',
+  ]) {
+    const response = await register({ redirect_uris: [redirectUri] });
+    assert.equal(response.status, 400, redirectUri);
+    assert.deepEqual(response.body, { error: 'invalid_redirect_uri' });
+  }
+});
+
 for (const [name, metadata] of [
   ['missing redirect URIs', {}],
   ['empty redirect URIs', { redirect_uris: [] }],
@@ -822,10 +836,13 @@ for (const clientRedirect of [
       redirect: 'manual',
     });
     assert.equal(response.status, 200);
-    const formAction = response.headers.get('content-security-policy')
+    const policy = response.headers.get('content-security-policy');
+    const redirectOrigin = new URL(clientRedirect).origin;
+    assert.equal(policy, `default-src 'none'; base-uri 'none'; form-action 'self' http://127.0.0.1:${upstream.address().port} ${redirectOrigin}; frame-ancestors 'none'; style-src 'unsafe-inline'`);
+    const formAction = policy
       .split(';').map((directive) => directive.trim()).find((directive) => directive.startsWith('form-action '));
     assert.deepEqual(formAction.split(/\s+/).slice(1), [
-      "'self'", `http://127.0.0.1:${upstream.address().port}`, new URL(clientRedirect).origin,
+      "'self'", `http://127.0.0.1:${upstream.address().port}`, redirectOrigin,
     ]);
     assert.equal(db.prepare('SELECT client_redirect_uri FROM consent_requests').get().client_redirect_uri, clientRedirect);
   });
