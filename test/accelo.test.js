@@ -6,7 +6,7 @@ process.env.ACCELO_CLIENT_ID = 'test-client';
 process.env.ACCELO_CLIENT_SECRET = 'test-secret';
 process.env.TOKEN_DB_PATH = ':memory:';
 
-const { acceloGet, acceloPost, acceloPut, withAcceloRetryBudget } = await import('../src/accelo.js');
+const { acceloGet, acceloPost, acceloPut, acceloTryPost, withAcceloRetryBudget } = await import('../src/accelo.js');
 
 function installTimers(t, delays) {
   t.mock.method(globalThis, 'setTimeout', (callback, delay) => {
@@ -98,4 +98,90 @@ test('retry wait is capped at 20 seconds for the whole tool call', async (t) => 
   }), { status: 429 });
   assert.equal(calls, 3);
   assert.deepEqual(delays, [10000, 10000]);
+});
+
+test('HTTP 200 meta.status=ok and responses without meta return their JSON', async (t) => {
+  const expected = { meta: { status: 'ok' }, response: [] };
+  t.mock.method(globalThis, 'fetch', async () => Response.json(expected));
+  assert.deepEqual(await acceloGet('token', '/test'), expected);
+  t.mock.restoreAll();
+
+  const withoutMeta = { response: [] };
+  t.mock.method(globalThis, 'fetch', async () => Response.json(withoutMeta));
+  assert.deepEqual(await acceloGet('token', '/test'), withoutMeta);
+});
+
+test('HTTP 200 with non-ok meta.status fails without retry and supports allowError', async (t) => {
+  let calls = 0;
+  const rejected = () => Response.json({
+    meta: { status: 'error', message: 'invalid write' },
+  });
+  t.mock.method(globalThis, 'fetch', async () => { calls += 1; return rejected(); });
+  await assert.rejects(acceloPut('token', '/draft', { title: 'test' }), (error) => {
+    assert.equal(error.message, 'Accelo API PUT /draft failed: 200 error invalid write');
+    assert.equal(error.status, 200);
+    assert.equal(error.acceloStatus, 'error');
+    return true;
+  });
+  assert.equal(calls, 1);
+  t.mock.restoreAll();
+
+  calls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { calls += 1; return rejected(); });
+  assert.deepEqual(await acceloTryPost('token', '/draft', {}), {
+    ok: false,
+    status: 200,
+    json: { meta: { status: 'error', message: 'invalid write' } },
+    message: 'invalid write',
+  });
+  assert.equal(calls, 1);
+});
+
+test('401 retries once with a fresh token for reads and writes', async (t) => {
+  for (const [method, request] of [['GET', () => acceloGet('old-token', '/test')], ['PUT', () => acceloPut('old-token', '/test', {})]]) {
+    let calls = 0;
+    const authorizations = [];
+    t.mock.method(globalThis, 'fetch', async (_url, options) => {
+      calls += 1;
+      authorizations.push(options.headers.Authorization);
+      return calls === 1
+        ? Response.json({ meta: { message: 'unauthorized' } }, { status: 401 })
+        : Response.json({ meta: { status: 'ok' }, response: [] });
+    });
+    let refreshes = 0;
+    await withAcceloRetryBudget(request, { reauth: async () => { refreshes += 1; return 'new-token'; } });
+    assert.equal(calls, 2);
+    assert.equal(refreshes, 1);
+    assert.ok(authorizations[0].endsWith('old-token'));
+    assert.ok(authorizations[1].endsWith('new-token'));
+    t.mock.restoreAll();
+  }
+});
+
+test('a second 401 fails after exactly one reauthorization', async (t) => {
+  let calls = 0;
+  let refreshes = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    calls += 1;
+    return Response.json({ meta: { message: 'unauthorized' } }, { status: 401 });
+  });
+  await assert.rejects(
+    withAcceloRetryBudget(() => acceloGet('old-token', '/test'), {
+      reauth: async () => { refreshes += 1; return 'new-token'; },
+    }),
+    (error) => error.message.includes('Accelo re-authorization required')
+  );
+  assert.equal(calls, 2);
+  assert.equal(refreshes, 1);
+});
+
+test('a failed reauthorization returns the typed reauthorization error', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () =>
+    Response.json({ meta: { message: 'unauthorized' } }, { status: 401 }));
+  await assert.rejects(
+    withAcceloRetryBudget(() => acceloGet('old-token', '/test'), {
+      reauth: async () => { throw new Error('private refresh failure'); },
+    }),
+    (error) => error.message.includes('Accelo re-authorization required') && error.status === 401
+  );
 });

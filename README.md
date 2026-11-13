@@ -7,6 +7,10 @@ OAuth, so every action respects that user's own Accelo permissions.
 
 > Status: early. Tools: `list_quotes`, `get_quote`, `get_deal`, `create_quote`, `update_quote`.
 
+Use the read-only `get_accelo_guide` tool for firm-specific API quirks. Tools
+that accept filters support a structured `filter` parameter (preferred); the
+raw `filters` parameter remains available as an advanced escape hatch.
+
 ## How auth works
 
 This server is an **OAuth proxy**:

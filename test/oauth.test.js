@@ -20,6 +20,9 @@ const redirectUri = 'https://client.example/callback';
 const execFileAsync = promisify(execFile);
 let directory, db, child, upstream, baseUrl;
 let output = '';
+let forceRefreshAcceloToken;
+let oauthDb;
+let refreshRequests = 0;
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -46,12 +49,24 @@ before(async () => {
     let body = '';
     for await (const chunk of req) body += chunk;
     const form = new URLSearchParams(body);
-    if (req.url !== '/token' || form.get('code') !== 'mock-accelo-code' ||
-        form.get('grant_type') !== 'authorization_code') {
+    if (req.url !== '/token') {
       res.writeHead(400).end();
       return;
     }
     res.setHeader('Content-Type', 'application/json');
+    if (form.get('grant_type') === 'refresh_token') {
+      refreshRequests += 1;
+      res.end(JSON.stringify({
+        access_token: 'mock-refreshed-access',
+        refresh_token: 'mock-rotated-refresh',
+        expires_in: 3600,
+      }));
+      return;
+    }
+    if (form.get('code') !== 'mock-accelo-code' || form.get('grant_type') !== 'authorization_code') {
+      res.writeHead(400).end();
+      return;
+    }
     res.end(JSON.stringify({
       access_token: 'mock-upstream-access',
       refresh_token: 'mock-upstream-refresh',
@@ -59,6 +74,13 @@ before(async () => {
     }));
   });
   const upstreamPort = await listen(upstream);
+  process.env.PUBLIC_BASE_URL = 'http://127.0.0.1';
+  process.env.ACCELO_CLIENT_ID = 'mock-upstream-client';
+  process.env.ACCELO_CLIENT_SECRET = randomBytes(24).toString('base64url');
+  process.env.ACCELO_OAUTH_URL = `http://127.0.0.1:${upstreamPort}`;
+  process.env.TOKEN_DB_PATH = tokenDbPath;
+  forceRefreshAcceloToken = (await import('../src/oauth.js')).forceRefreshAcceloToken;
+  oauthDb = (await import('../src/db.js')).default;
   const reservation = http.createServer();
   const port = await listen(reservation);
   await new Promise((resolve) => reservation.close(resolve));
@@ -76,6 +98,7 @@ before(async () => {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Server startup timed out: ${output}`)), 10000);
     child.once('error', (error) => { clearTimeout(timer); reject(error); });
@@ -99,6 +122,16 @@ before(async () => {
   assert.equal(db.prepare('SELECT last_used_at FROM clients WHERE client_id = ?').get('legacy-client').last_used_at, null);
 });
 
+test('concurrent forced refreshes for one subject share one network refresh', async () => {
+  const subject = 'forced-refresh-subject';
+  refreshRequests = 0;
+  db.prepare('INSERT INTO accelo_tokens (subject, access_token, refresh_token, expires_at, created_at) VALUES (?,?,?,?,?)')
+    .run(subject, 'old-access', 'old-refresh', Date.now() + 3600000, Date.now());
+  const tokens = await Promise.all(Array.from({ length: 8 }, () => forceRefreshAcceloToken(subject)));
+  assert.deepEqual(tokens, Array(8).fill('mock-refreshed-access'));
+  assert.equal(refreshRequests, 1);
+});
+
 after(async () => {
   if (child && child.exitCode === null && child.signalCode === null) {
     const exited = once(child, 'exit');
@@ -106,6 +139,7 @@ after(async () => {
     await exited;
   }
   db?.close();
+  oauthDb?.close();
   if (upstream) await new Promise((resolve) => upstream.close(resolve));
   if (directory) await rm(directory, { recursive: true, force: true });
 });
@@ -1023,7 +1057,7 @@ test('registered confidential client completes PKCE authorization, callback, red
   const listed = await mcpRequest(issued.access_token, 'tools/list');
   assert.equal(listed.status, 200);
   const listedBody = await mcpJson(listed);
-  assert.equal(listedBody.result.tools.length, 37, 'dynamically registered LibreChat clients retain all tools');
+  assert.equal(listedBody.result.tools.length, 38, 'dynamically registered LibreChat clients retain all tools');
   assert.equal((await token(request)).status, 400);
   const refreshRequest = {
     grant_type: 'refresh_token', refresh_token: issued.refresh_token,
@@ -1063,7 +1097,7 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   const fullAccess = seedAccessToken(fullClient.client_id);
   const fullList = await mcpRequest(fullAccess, 'tools/list');
   const fullTools = (await mcpJson(fullList)).result.tools;
-  assert.equal(fullTools.length, 37);
+  assert.equal(fullTools.length, 38);
   assert.ok(fullTools.some((tool) => tool.name === 'get_company_profile_values'));
 
   const defaultResponse = await fetch(`${baseUrl}/register`, {
@@ -1085,13 +1119,13 @@ test('dynamic registration accepts supported scopes and defaults absent scope to
   assert.deepEqual(await invalidResponse.json(), { error: 'invalid_client_metadata' });
 });
 
-test('read-only clients see only the 26 allowlisted tools and cannot call a write tool', async () => {
+test('read-only clients see only the 27 allowlisted tools and cannot call a write tool', async () => {
   db.prepare('UPDATE clients SET scope = ? WHERE client_id = ?').run('read_only', clientId);
   const access = seedAccessToken(clientId);
   const listed = await mcpRequest(access, 'tools/list');
   assert.equal(listed.status, 200);
   const names = (await mcpJson(listed)).result.tools.map((tool) => tool.name);
-  assert.equal(names.length, 26);
+  assert.equal(names.length, 27);
   for (const name of [
     'list_activities', 'get_activity', 'get_activity_recipients', 'get_activity_thread',
     'list_activity_attachments', 'list_matter_attachments', 'list_matter_collections', 'get_company_profile_values',
@@ -1099,6 +1133,7 @@ test('read-only clients see only the 26 allowlisted tools and cannot call a writ
     'list_quotes', 'get_quote', 'get_deal', 'get_project_plan', 'list_tasks',
     'get_task', 'list_task_progressions', 'get_project_profile_values', 'list_project_activities',
     'search_companies', 'get_company', 'get_matter_contacts',
+    'get_accelo_guide',
   ]) {
     assert.ok(names.includes(name), `${name} is registered for read-only clients`);
   }
@@ -1123,11 +1158,11 @@ test('read-only clients see only the 26 allowlisted tools and cannot call a writ
 test('legacy NULL-scope and dangling-client tokens resolve to the intended capabilities', async () => {
   const legacyAccess = seedAccessToken('legacy-client');
   const legacyList = await mcpRequest(legacyAccess, 'tools/list');
-  assert.equal((await mcpJson(legacyList)).result.tools.length, 37);
+  assert.equal((await mcpJson(legacyList)).result.tools.length, 38);
 
   const orphanAccess = seedAccessToken('deleted-client');
   const orphanList = await mcpRequest(orphanAccess, 'tools/list');
-  assert.equal((await mcpJson(orphanList)).result.tools.length, 26);
+  assert.equal((await mcpJson(orphanList)).result.tools.length, 27);
 });
 
 test('full-scope write tools preserve the confirm:true preview response', async () => {

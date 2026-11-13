@@ -4,8 +4,8 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 const log = (...a) => console.log(new Date().toISOString(), '[accelo]', ...a);
 const retryBudget = new AsyncLocalStorage();
 
-export function withAcceloRetryBudget(callback) {
-  return retryBudget.run({ waitedMs: 0 }, callback);
+export function withAcceloRetryBudget(callback, { reauth } = {}) {
+  return retryBudget.run({ waitedMs: 0, reauth }, callback);
 }
 
 function retryDelay(res, retryNumber) {
@@ -78,6 +78,7 @@ async function acceloFetch(token, pathname, { method = 'GET', query, body, allow
     opts.body = new URLSearchParams(body).toString();
   }
   const budget = retryBudget.getStore() || { waitedMs: 0 };
+  let reauthenticated = false;
   const canRetry = (status) => method === 'GET'
     ? [429, 502, 503, 504].includes(status)
     : status === 429;
@@ -86,7 +87,39 @@ async function acceloFetch(token, pathname, { method = 'GET', query, body, allow
     const text = await res.text();
     let json;
     try { json = JSON.parse(text); } catch { json = { raw: text }; }
-    if (res.ok) return json;
+    if (res.ok) {
+      const meta = json && typeof json === 'object' && json.meta;
+      if (meta && typeof meta === 'object' && meta.status !== undefined && meta.status !== 'ok') {
+        const message = meta.message || String(meta.status);
+        if (allowError) return { ok: false, status: res.status, json, message };
+        log('ERROR', 'attempt', attempt, 'status', res.status, 'backoff_ms', 0);
+        const error = new Error(
+          `Accelo API ${method} ${pathname} failed: ${res.status} ${meta.status} ${meta.message || ''}`
+        );
+        error.status = res.status;
+        error.acceloStatus = meta.status;
+        throw error;
+      }
+      return json;
+    }
+
+    if (res.status === 401 && budget.reauth && !reauthenticated) {
+      reauthenticated = true;
+      try {
+        const freshToken = await budget.reauth();
+        opts.headers.Authorization = 'Bearer ' + freshToken;
+      } catch {
+        const error = new Error('Accelo re-authorization required');
+        error.status = 401;
+        throw error;
+      }
+      continue;
+    }
+    if (res.status === 401 && reauthenticated) {
+      const error = new Error('Accelo re-authorization required');
+      error.status = 401;
+      throw error;
+    }
 
     if (attempt <= 3 && canRetry(res.status)) {
       const backoffMs = retryDelay(res, attempt);

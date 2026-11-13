@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { getValidAcceloToken } from './oauth.js';
 import { fetchWindow } from './pagination.js';
 import { acceloGet } from './accelo.js';
+import { buildFilters, structuredFilterSchema } from './filters.js';
 
 // Issues module for the Accelo MCP: issue (ticket) records, profile values
 // (custom fields), and scoped activity lists.
@@ -48,7 +49,7 @@ function ok(data) {
 // convention (comma-separated). The raw `filters` string (if provided) is
 // appended verbatim — it is the guaranteed-correct escape hatch when a
 // structured token name does not match this deployment.
-function buildIssueFilters({ against_type, against_id, affiliation_id, contract_id, status, standing, issue_type, filters }) {
+function buildIssueFilters({ against_type, against_id, affiliation_id, contract_id, status, standing, issue_type, filters }, structuredFilter) {
   const parts = [];
   if (against_type) parts.push(`against_type(${against_type})`);
   if (against_id) parts.push(`against_id(${against_id})`);
@@ -57,6 +58,7 @@ function buildIssueFilters({ against_type, against_id, affiliation_id, contract_
   if (status) parts.push(`status(${status})`);
   if (standing) parts.push(`standing(${standing})`);
   if (issue_type) parts.push(`type(${issue_type})`);
+  if (structuredFilter) parts.push(structuredFilter);
   if (filters) parts.push(filters); // raw passthrough, capped at the schema level
   return parts.join(',');
 }
@@ -118,14 +120,19 @@ export function registerIssueTools(server, subject) {
       standing: z.string().max(100).optional().describe('Issue standing to filter by, e.g. "active", "closed", "resolved".'),
       issue_type: z.string().max(100).optional().describe('Issue type ID to filter by (deployment-specific).'),
       search: z.string().max(200).optional().describe('Free-text search (_search) across the issue title. Used sparingly at this firm.'),
+      filter: structuredFilterSchema.optional().describe('Structured filter (preferred over raw filters).'),
       filters: z.string().max(500).optional().describe('ADVANCED: raw Accelo _filters expression forwarded verbatim, e.g. "standing(active),date_created_after(1490140800)". BYPASSES the structured filters above. Max 500 chars.'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 50, max 100).'),
       page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number (default 0).'),
     },
     async (args) => {
+      if (args.filter !== undefined && args.filters !== undefined) {
+        return ok({ status: 'error', message: 'Provide either filter or filters, not both.' });
+      }
+      const structuredFilter = args.filter === undefined ? undefined : buildFilters(args.filter);
       const token = await getValidAcceloToken(subject);
       const lim = args.limit || 50;
-      const filterExpr = buildIssueFilters(args);
+      const filterExpr = buildIssueFilters(args, structuredFilter);
 
       const baseQuery = {
         _fields: ISSUE_FIELDS,

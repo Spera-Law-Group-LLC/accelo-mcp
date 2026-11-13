@@ -205,6 +205,23 @@ test('list_issues labels raw-filter results as unverified', async (t) => {
   });
 });
 
+test('list_issues applies structured filters and rejects structured-plus-raw filters before fetching', async (t) => {
+  const requests = mockIssueReads(t, [{ id: '1', standing: 'active', date_created: '1700000000' }]);
+  const result = await callTool('list_issues', { filter: { standing: 'active' } });
+  assert.equal(result.length, 1);
+  assert.match(requests[0].searchParams.get('_filters'), /^standing\(active\),order_by_desc/);
+
+  let calls = 0;
+  t.mock.restoreAll();
+  t.mock.method(globalThis, 'fetch', async () => { calls += 1; return Response.json({ response: [] }); });
+  const conflict = await callTool('list_issues', {
+    filter: { standing: 'active' },
+    filters: 'status(open)',
+  });
+  assert.deepEqual(conflict, { status: 'error', message: 'Provide either filter or filters, not both.' });
+  assert.equal(calls, 0);
+});
+
 test('issue profile values distinguish definition and value IDs and allow field selection', async (t) => {
   const requests = mockIssueReads(t, [
     { id: '9001', field_id: '62', field_name: 'Project Folder', field_type: 'hyperlink', value: 'https://drive.example/one' },
