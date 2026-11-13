@@ -2,8 +2,10 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import * as accelo from './accelo.js';
 import { withAcceloRetryBudget } from './accelo.js';
-import { getValidAcceloToken } from './oauth.js';
+import { forceRefreshAcceloToken, getValidAcceloToken } from './oauth.js';
 import { config } from './config.js';
+import { buildFilters, structuredFilterSchema } from './filters.js';
+import { ACCELO_GUIDE } from './guide.js';
 import { registerProjectTools } from './projects.js';
 import { registerActivityTools } from './activities.js';
 import { registerIssueTools } from './issues.js';
@@ -92,9 +94,10 @@ const READ_TOOLS = new Set([
   'list_activity_attachments',
   'list_matter_attachments',
   'list_matter_collections',
+  'get_accelo_guide',
 ]);
 
-export function scopedServer(server, scope) {
+export function scopedServer(server, scope, subject) {
   return new Proxy(server, {
     get(target, prop, receiver) {
       if (prop !== 'tool') return Reflect.get(target, prop, receiver);
@@ -103,7 +106,10 @@ export function scopedServer(server, scope) {
         const handlerIndex = rest.length - 1;
         if (typeof rest[handlerIndex] === 'function') {
           const handler = rest[handlerIndex];
-          rest[handlerIndex] = (...args) => withAcceloRetryBudget(() => handler(...args));
+          rest[handlerIndex] = (...args) => withAcceloRetryBudget(
+            () => handler(...args),
+            subject ? { reauth: () => forceRefreshAcceloToken(subject) } : undefined
+          );
         }
         return target.tool(name, ...rest);
       };
@@ -115,8 +121,15 @@ export function scopedServer(server, scope) {
 // (i.e. one Accelo user). All Accelo calls run as that user, so Accelo's
 // own permission model is respected.
 export function buildServer(subject, scope = 'full') {
-  const server = new McpServer({ name: 'accelo-mcp', version: '0.5.0' });
-  const tools = scopedServer(server, scope);
+  const server = new McpServer({ name: 'accelo-mcp', version: '0.6.0' });
+  const tools = scopedServer(server, scope, subject);
+
+  tools.tool(
+    'get_accelo_guide',
+    'Get the firm-curated guide to Accelo API quirks and filtering.',
+    {},
+    async () => ({ content: [{ type: 'text', text: ACCELO_GUIDE }] })
+  );
 
   tools.tool(
     'list_quotes',
@@ -125,11 +138,16 @@ export function buildServer(subject, scope = 'full') {
       search: z.string().optional().describe('Free-text search across the quote title'),
       limit: z.number().int().min(1).max(100).optional().describe('Max results (default 25)'),
       page: z.number().int().min(0).max(10000).optional().describe('Zero-based page number'),
+      filter: structuredFilterSchema.optional().describe('Structured filter (preferred over raw filters).'),
       filters: z.string().max(500).optional().describe("ADVANCED: raw Accelo _filters expression forwarded verbatim, e.g. standing(active). BYPASSES any structured scoping; max 500 chars."),
     },
-    async ({ search, limit, page, filters }) => {
+    async ({ search, limit, page, filter, filters }) => {
+      if (filter !== undefined && filters !== undefined) {
+        return ok({ status: 'error', message: 'Provide either filter or filters, not both.' });
+      }
+      const filterExpr = filter === undefined ? filters : buildFilters(filter);
       const token = await getValidAcceloToken(subject);
-      return ok(await accelo.listQuotes(token, { search, limit, page, filters }));
+      return ok(await accelo.listQuotes(token, { search, limit, page, filters: filterExpr }));
     }
   );
 

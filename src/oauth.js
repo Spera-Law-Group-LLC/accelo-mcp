@@ -66,14 +66,16 @@ async function doRefresh(subject) {
 // only one network call happens at a time per subject. Uses double-checked
 // locking: once the lock is acquired, if another caller already refreshed the
 // token (now valid), return it without a redundant round-trip.
-export async function refreshAcceloToken(subject) {
+async function refreshAcceloTokenWithCoalescing(subject, force = false) {
   const existing = inFlightRefreshes.get(subject);
   if (existing) return existing;
 
   const p = (async () => {
     // Double-check: another concurrent caller may have just refreshed.
-    const row = db.prepare('SELECT * FROM accelo_tokens WHERE subject = ?').get(subject);
-    if (row && Date.now() < row.expires_at - 60000) return row.access_token;
+    if (!force) {
+      const row = db.prepare('SELECT * FROM accelo_tokens WHERE subject = ?').get(subject);
+      if (row && Date.now() < row.expires_at - 60000) return row.access_token;
+    }
     return doRefresh(subject);
   })();
 
@@ -83,6 +85,14 @@ export async function refreshAcceloToken(subject) {
   } finally {
     inFlightRefreshes.delete(subject);
   }
+}
+
+export async function refreshAcceloToken(subject) {
+  return refreshAcceloTokenWithCoalescing(subject);
+}
+
+export async function forceRefreshAcceloToken(subject) {
+  return refreshAcceloTokenWithCoalescing(subject, true);
 }
 
 // Return a valid Accelo access token for the subject, refreshing if near expiry.
